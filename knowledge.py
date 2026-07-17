@@ -189,16 +189,16 @@ class AgentKnowledge:
         For each pair of clue cells A and B where the unknown-neighbour set of A
         is a subset of the unknown-neighbour set of B:
 
-            unknowns_A ⊆ unknowns_B
-            clue_A - known_mines_A == clue_B - known_mines_B - len(unknowns_B \ unknowns_A)
+            unknowns_A subset of unknowns_B
+            clue_A - known_mines_A == clue_B - known_mines_B - |unknowns_B \\ unknowns_A|
 
         Deductions:
             If remaining_A == len(unknowns_A): every unknown of A is a mine.
             If remaining_A == 0: every unknown of A is safe.
             If remaining_B - remaining_A == len(unknowns_B) - len(unknowns_A):
-                all cells in unknowns_B \ unknowns_A are mines.
+                all cells in unknowns_B \\ unknowns_A are mines.
             If remaining_B - remaining_A == 0:
-                all cells in unknowns_B \ unknowns_A are safe.
+                all cells in unknowns_B \\ unknowns_A are safe.
 
         Returns the number of new inferences made.
         """

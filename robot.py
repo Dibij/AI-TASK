@@ -140,12 +140,6 @@ class Robot:
         self.total_timeouts         : int   = 0
         self.total_efficiency       : List[float] = []
         self.total_wait_times       : List[int]   = []
-
-        # Legacy alias for compatibility with game.py / renderer
-        @property
-        def total_deaths(self):
-            return self.total_mine_deaths + self.total_collision_deaths
-
     # ------------------------------------------------------------------
     # Round lifecycle
     # ------------------------------------------------------------------

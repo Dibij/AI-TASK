@@ -1113,12 +1113,12 @@ class TestUtils:
         assert result == 4
 
     def test_shortest_path_length_oracle_with_wall(self):
-        # Wall blocks direct path; must go around
-        wall = {(0, c) for c in range(1, 5)}  # block row 0 cols 1-4
-        result = shortest_path_length((0, 0), (0, 4), 5, 5, wall_set=wall)
-        assert result is not None
-        assert result > 4  # must go around
-
+        # Wall blocks direct path from (0,0) to (9,0); must go around
+        # Goal (9,0) is NOT a wall
+        wall = {(r, 4) for r in range(0, 9)}  # vertical wall across cols 4
+        result = shortest_path_length((0, 0), (0, 9), 10, 10, wall_set=wall)
+        assert result is not None, "BFS should find an alternate path around the wall"
+        assert result > 9  # must go around the wall
     def test_shortest_path_length_knowledge_open_grid(self):
         result = shortest_path_length_knowledge(
             (0, 0), (0, 4), 5, 5,

@@ -2,7 +2,7 @@
 experiments.py — Headless experiment runner for the multi-agent grid world.
 
 Supports reproducible, paired-comparison experiments across different
-planner configurations.
+planner configurations and personality sweeps.
 
 Experiment Configurations
 =========================
@@ -12,9 +12,21 @@ Experiment Configurations
   D (no_collision): Risk-aware A* with collision weight = 0.
   E (risk_aware):   Risk-aware A* with collision weight enabled (same as B, default).
 
+Personality Sweeps
+==================
+  --personality-sweep risk_tolerance  Varies risk tolerance (0.1–0.9)
+  --personality-sweep patience        Varies patience (0.1–0.9)
+  --personality-sweep speed           Varies speed (1–2)
+
+  Sweeps control one parameter while keeping others fixed, answering:
+    - Does higher risk tolerance increase speed but reduce survival?
+    - Does higher patience reduce collisions?
+    - Does higher speed improve completion time?
+
 Usage
 =====
   python experiments.py --seed 42 --rounds 10 --configs A B C
+  python experiments.py --personality-sweep risk_tolerance --seed 42
   python experiments.py --help
 
 Output
@@ -38,7 +50,6 @@ import json
 import os
 import datetime
 import collections
-import copy
 import random
 from typing import Dict, List, Optional
 
@@ -98,6 +109,46 @@ EXPERIMENT_CONFIGS: Dict[str, Dict] = {
                          "Paired with D to measure collision avoidance contribution."),
         "planner"     : "risk_aware",
         "config"      : CONFIGS["risk_aware"],
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Personality sweep configurations
+# ---------------------------------------------------------------------------
+
+# Each sweep varies one robot personality parameter while keeping others fixed.
+# This allows measuring the causal effect of each trait on outcomes.
+PERSONALITY_SWEEPS: Dict[str, Dict] = {
+    "risk_tolerance": {
+        "param"     : "risk_tolerance",
+        "label"     : "Risk Tolerance",
+        "values"    : [0.1, 0.3, 0.5, 0.7, 0.9],
+        "planner"   : "risk_aware",
+        "questions" : [
+            "Does higher risk tolerance increase completion speed but reduce survival?",
+            "What tolerance maximises efficiency in moderate-mine environments?",
+        ],
+    },
+    "patience": {
+        "param"     : "patience",
+        "label"     : "Patience",
+        "values"    : [0.1, 0.3, 0.5, 0.7, 0.9],
+        "planner"   : "risk_aware",
+        "questions" : [
+            "Does higher patience increase waiting behaviour but reduce collisions?",
+            "What patience level minimises timeout rate?",
+        ],
+    },
+    "speed": {
+        "param"     : "speed",
+        "label"     : "Speed",
+        "values"    : [1, 2],
+        "planner"   : "risk_aware",
+        "questions" : [
+            "Does higher speed reduce ticks-to-goal?",
+            "Does higher speed increase mine death rate (less cautious movement)?",
+        ],
     },
 }
 
@@ -226,9 +277,8 @@ def run_experiment(config_key: str, seed: int, num_rounds: int,
         print(f"{'='*60}")
 
     # Create robots with fixed personalities for the experiment
-    # Personalities are seeded from the base seed for reproducibility
     random.seed(seed)
-    dummy_world = GridWorld(seed=seed)  # used to init robots; replaced each round
+    dummy_world = GridWorld(seed=seed)
     robots = [
         Robot(i, dummy_world, planner_name=planner_name, planner_config=planner_config)
         for i in range(num_robots)
@@ -241,11 +291,9 @@ def run_experiment(config_key: str, seed: int, num_rounds: int,
         world = GridWorld(seed=round_seed)
         world.visited = collections.defaultdict(set)
 
-        # Update world reference for all robots
         for r in robots:
             r.world = world
 
-        # Pick start/target positions
         passable = [
             c for c in world._all_cells()
             if c not in world.walls and c not in world.mines
@@ -253,23 +301,21 @@ def run_experiment(config_key: str, seed: int, num_rounds: int,
         if len(passable) < num_robots * 2:
             passable = [c for c in world._all_cells() if c not in world.walls]
 
-        random.seed(round_seed)  # ensure reproducible positions
+        random.seed(round_seed)
         chosen = random.sample(passable, min(num_robots * 2, len(passable)))
         starts  = chosen[:num_robots]
         targets = chosen[num_robots:num_robots*2]
 
-        # Safe-zone: clear mines near starts
         for s in starts:
             for dr in [-1, 0, 1]:
                 for dc in [-1, 0, 1]:
                     world.mines.discard((s[0]+dr, s[1]+dc))
         world._compute_clues()
 
-        # Reset robots
         for i, robot in enumerate(robots):
             robot.reset_round(
                 starts[i], targets[i],
-                oracle_wall_set=world.walls  # [ORACLE] for efficiency metric only
+                oracle_wall_set=world.walls
             )
 
         if verbose:
@@ -283,7 +329,6 @@ def run_experiment(config_key: str, seed: int, num_rounds: int,
         result["world_walls"] = world.count_walls()
         round_results.append(result)
 
-        # Accumulate into robot stats
         for robot in robots:
             robot.record_round_result()
 
@@ -291,11 +336,9 @@ def run_experiment(config_key: str, seed: int, num_rounds: int,
             reached = sum(1 for rr in result["robots"] if rr["reached"])
             mine_d  = sum(1 for rr in result["robots"] if rr["hit_mine"])
             coll_d  = sum(1 for rr in result["robots"] if rr["hit_robot"])
-            print(f"  → ✅{reached} 💥mine={mine_d} 💥coll={coll_d} "
+            print(f"  -> {reached} reached, {mine_d} mine, {coll_d} coll, "
                   f"ticks={result['ticks']}")
 
-    # Compute aggregate metrics
-    total_rounds_each = num_rounds
     aggregate = {}
     for robot in robots:
         total = len(robot.total_efficiency)
@@ -304,15 +347,12 @@ def run_experiment(config_key: str, seed: int, num_rounds: int,
             "speed"                : robot.speed,
             "risk_tolerance"       : round(robot.risk_tolerance, 3),
             "patience"             : round(robot.patience, 3),
-            # Safety
             "survival_rate"        : robot.total_wins / max(1, total),
             "mine_death_rate"      : robot.total_mine_deaths / max(1, total),
             "collision_death_rate" : robot.total_collision_deaths / max(1, total),
             "timeout_rate"         : robot.total_timeouts / max(1, total),
-            # Task performance
             "completion_rate"      : robot.total_wins / max(1, total),
             "avg_efficiency"       : (sum(robot.total_efficiency) / max(1, total)),
-            # Decision behaviour
             "avg_waits"            : (sum(robot.total_wait_times) / max(1, total)),
         }
 
@@ -341,8 +381,8 @@ def run_experiment(config_key: str, seed: int, num_rounds: int,
 def _print_summary(result_doc: Dict) -> None:
     """Print a readable summary table to terminal."""
     meta = result_doc["meta"]
-    print(f"\n--- Summary: {meta['config_key']} — {meta['config_name']} ---")
-    print(f"{'Robot':<12} {'Survival':>9} {'Mine✗':>7} {'Coll✗':>7} "
+    print(f"\n--- Summary: {meta['config_key']} - {meta['config_name']} ---")
+    print(f"{'Robot':<12} {'Survival':>9} {'MineX':>7} {'CollX':>7} "
           f"{'Timeout':>8} {'Efficiency':>11} {'Avg Waits':>10}")
     print("-" * 68)
     for name, stats in result_doc["aggregate"].items():
@@ -391,7 +431,6 @@ def run_paired_comparison(config_keys: List[str], seed: int, num_rounds: int,
             num_robots=num_robots, verbose=verbose
         )
 
-    # Save combined results
     os.makedirs("logs", exist_ok=True)
     keys_str = "_".join(config_keys)
     ts       = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -401,7 +440,7 @@ def run_paired_comparison(config_keys: List[str], seed: int, num_rounds: int,
 
     if verbose:
         print(f"\n{'='*60}")
-        print(f"Paired comparison complete. Results saved → {filename}")
+        print(f"Paired comparison complete. Results saved -> {filename}")
         _print_comparison_table(results, config_keys)
 
     return results
@@ -440,6 +479,191 @@ def _print_comparison_table(results: Dict, config_keys: List[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Personality sweep runner
+# ---------------------------------------------------------------------------
+
+def run_personality_sweep(sweep_key: str, seed: int, num_rounds: int,
+                          num_robots: int = 4, planner_type: str = "risk_aware",
+                          verbose: bool = True) -> Dict[str, Dict]:
+    """
+    Run a controlled personality sweep: vary one parameter, keep others fixed.
+
+    All robots in a run share the same personality value for the swept parameter,
+    ensuring clean attribution of effect.  Robots are the same population;
+    only the swept parameter differs across runs.
+
+    Args:
+        sweep_key   : key from PERSONALITY_SWEEPS
+        seed        : base random seed
+        num_rounds  : number of rounds per value
+        num_robots  : number of robots per round
+        planner_type: planner configuration for all runs
+        verbose     : print progress
+
+    Returns:
+        Dict mapping value (e.g. "0.1") -> experiment result for that level.
+    """
+    sweep_cfg = PERSONALITY_SWEEPS[sweep_key]
+    param     = sweep_cfg["param"]
+    values    = sweep_cfg["values"]
+    label     = sweep_cfg["label"]
+
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"Personality Sweep: {label} ({param})")
+        print(f"  Values  : {values}")
+        print(f"  Seed    : {seed}")
+        print(f"  Rounds  : {num_rounds}")
+        print(f"  Planner : {planner_type}")
+        print(f"  Questions:")
+        for q in sweep_cfg["questions"]:
+            print(f"    - {q}")
+        print(f"{'='*60}")
+
+    results: Dict[str, Dict] = {}
+
+    for val in values:
+        if verbose:
+            print(f"\n  --- {label} = {val} ---")
+
+        # All robots get the same fixed personality for this sweep value
+        random.seed(seed)
+        dummy_world = GridWorld(seed=seed)
+        robots = [
+            Robot(i, dummy_world, planner_name=planner_type)
+            for i in range(num_robots)
+        ]
+
+        # Override the swept parameter for all robots
+        for r in robots:
+            setattr(r, param, val)
+
+        # Run rounds
+        round_results = []
+        for rnd in range(num_rounds):
+            round_seed = seed + rnd
+            world = GridWorld(seed=round_seed)
+            world.visited = collections.defaultdict(set)
+
+            for r in robots:
+                r.world = world
+
+            passable = [
+                c for c in world._all_cells()
+                if c not in world.walls and c not in world.mines
+            ]
+            if len(passable) < num_robots * 2:
+                passable = [c for c in world._all_cells() if c not in world.walls]
+
+            random.seed(round_seed)
+            chosen = random.sample(passable, min(num_robots * 2, len(passable)))
+            starts  = chosen[:num_robots]
+            targets = chosen[num_robots:num_robots*2]
+
+            for s in starts:
+                for dr in [-1, 0, 1]:
+                    for dc in [-1, 0, 1]:
+                        world.mines.discard((s[0]+dr, s[1]+dc))
+            world._compute_clues()
+
+            for i, robot in enumerate(robots):
+                robot.reset_round(
+                    starts[i], targets[i],
+                    oracle_wall_set=world.walls
+                )
+
+            result = run_single_round(world, robots, max_ticks=MAX_TICKS, log=False)
+            result["round"] = rnd + 1
+            result["round_seed"] = round_seed
+            result["world_mines"] = world.count_mines()
+            result["world_walls"] = world.count_walls()
+            round_results.append(result)
+
+            for robot in robots:
+                robot.record_round_result()
+
+        # Compute aggregate
+        aggregate = {}
+        for robot in robots:
+            total = len(robot.total_efficiency)
+            aggregate[robot.name] = {
+                param                : val,
+                "survival_rate"      : robot.total_wins / max(1, total),
+                "mine_death_rate"    : robot.total_mine_deaths / max(1, total),
+                "collision_death_rate": robot.total_collision_deaths / max(1, total),
+                "timeout_rate"       : robot.total_timeouts / max(1, total),
+                "completion_rate"    : robot.total_wins / max(1, total),
+                "avg_efficiency"     : (sum(robot.total_efficiency) / max(1, total)),
+                "avg_waits"          : (sum(robot.total_wait_times) / max(1, total)),
+            }
+
+        results[str(val)] = {
+            "meta": {
+                "sweep"       : sweep_key,
+                "param"       : param,
+                "value"       : val,
+                "planner"     : planner_type,
+                "seed"        : seed,
+                "num_rounds"  : num_rounds,
+                "num_robots"  : num_robots,
+                "max_ticks"   : MAX_TICKS,
+                "timestamp"   : datetime.datetime.now().isoformat(),
+            },
+            "aggregate": aggregate,
+            "rounds"   : round_results,
+        }
+
+        if verbose:
+            avg_survival = sum(stats["survival_rate"] for stats in aggregate.values()) / len(aggregate)
+            avg_eff      = sum(stats["avg_efficiency"] for stats in aggregate.values()) / len(aggregate)
+            print(f"  -> survival={avg_survival:.1%}, efficiency={avg_eff:.3f}")
+
+    # Save sweep results
+    os.makedirs("logs", exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = os.path.join("logs", f"sweep_{sweep_key}_seed{seed}_{ts}.json")
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=4)
+
+    if verbose:
+        print(f"\n  Sweep results saved -> {filename}")
+        _print_sweep_summary(results, label, param, verbose=True)
+
+    return results
+
+
+def _print_sweep_summary(results: Dict[str, Dict], label: str,
+                         param: str, verbose: bool = False) -> None:
+    """Print a summary of a personality sweep across all values."""
+    values_sorted = sorted(results.keys(), key=float)
+    print(f"\n{'='*60}")
+    print(f"Personality Sweep: {label}")
+    print(f"{'Value':<10} {'Survival':>9} {'MineX':>7} {'CollX':>7} "
+          f"{'Timeout':>8} {'Efficiency':>11} {'Avg Waits':>10}")
+    print("-" * 68)
+
+    for val_str in values_sorted:
+        r   = results[val_str]
+        agg = r["aggregate"]
+        avg_survival = sum(s["survival_rate"] for s in agg.values()) / max(1, len(agg))
+        avg_mine     = sum(s["mine_death_rate"] for s in agg.values()) / max(1, len(agg))
+        avg_coll     = sum(s["collision_death_rate"] for s in agg.values()) / max(1, len(agg))
+        avg_timeout  = sum(s["timeout_rate"] for s in agg.values()) / max(1, len(agg))
+        avg_eff      = sum(s["avg_efficiency"] for s in agg.values()) / max(1, len(agg))
+        avg_waits    = sum(s["avg_waits"] for s in agg.values()) / max(1, len(agg))
+
+        print(
+            f"{val_str:<10} "
+            f"{avg_survival:>8.1%} "
+            f"{avg_mine:>7.1%} "
+            f"{avg_coll:>7.1%} "
+            f"{avg_timeout:>7.1%} "
+            f"{avg_eff:>10.3f} "
+            f"{avg_waits:>9.1f}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -465,11 +689,26 @@ def main():
         help="Experiment configurations to run (default: A B C)"
     )
     parser.add_argument(
+        "--personality-sweep",
+        choices=list(PERSONALITY_SWEEPS.keys()),
+        help="Run a personality sweep instead of config comparison"
+    )
+    parser.add_argument(
         "--quiet", action="store_true",
         help="Suppress per-round progress output"
     )
 
     args = parser.parse_args()
+
+    if args.personality_sweep:
+        run_personality_sweep(
+            sweep_key=args.personality_sweep,
+            seed=args.seed,
+            num_rounds=args.rounds,
+            num_robots=args.robots,
+            verbose=not args.quiet,
+        )
+        return
 
     print(f"\nMulti-Agent Grid World Experiment Runner")
     print(f"  Seed    : {args.seed}")
@@ -480,7 +719,7 @@ def main():
 
     print("Available experiment configurations:")
     for key, cfg in EXPERIMENT_CONFIGS.items():
-        marker = "★" if key in args.configs else " "
+        marker = "*" if key in args.configs else " "
         print(f"  {marker} [{key}] {cfg['name']}: {cfg['description'][:60]}...")
     print()
 
