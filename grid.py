@@ -1,54 +1,129 @@
 """
-grid.py — GridWorld: terrain generation, mine placement, shared knowledge.
+grid.py — GridWorld: terrain generation (ground truth only).
+
+ARCHITECTURE NOTE — Ground Truth vs. Agent Knowledge
+=====================================================
+GridWorld holds and manages ONLY ground-truth state:
+  - self.walls      : set of true wall cells
+  - self.mines      : set of true mine cells
+  - self._mine_clues: hidden adjacency counts per empty cell
+
+Agent-observable state lives in AgentKnowledge (see knowledge.py).
+GridWorld exposes a single AgentKnowledge instance (self.knowledge)
+that is updated whenever a robot discovers or scans a cell.
+
+ALL ROBOTS SHARE ONE AgentKnowledge INSTANCE.
+This models a cooperative swarm with shared radio communication.
+This is an intentional design decision, not accidental ground-truth leakage.
+If independent per-robot knowledge is desired, each Robot would hold its own
+AgentKnowledge and only update it via its own discover() calls.
+
+Ground-truth methods (is_wall, is_mine, is_passable_true) must NOT be called
+from robot decision logic, planners, or the probability model.
+They may only be called by:
+  - The physics engine (does this step kill the robot? → discover())
+  - The renderer (dimly showing hidden mines for debugging/display)
+  - Oracle evaluation metrics (labelled [ORACLE] in code comments)
 
 Generation pipeline:
   1. Start with all cells empty.
-  2. Attempt to add wall cells one-by-one with BFS connectivity check (rejection sampling).
-     Target: 12% wall density, but walls tend to cluster into corridors naturally.
-  3. Scatter mines on ~8% of remaining passable cells.
+  2. Attempt to add wall cells with BFS connectivity check (rejection sampling).
+     Target: ~15% wall density.
+  3. Scatter mines on ~5% of remaining passable cells.
   4. Pre-compute hidden mine-adjacency clue numbers for every empty cell.
-
-Shared Knowledge (updated as robots explore):
-  - known_cells: dict (r,c) -> 'empty' | 'wall' | 'mine'
-  - known_clues: dict (r,c) -> int  (Minesweeper-style adjacency numbers)
-  - mine_probability_cache: updated after each new discovery
 """
 
 import random
 import collections
+from typing import Optional, Set, Tuple
+
 from utils import is_fully_connected, bfs_all_reachable
+from knowledge import AgentKnowledge, CellStatus
+
+
+# ---------------------------------------------------------------------------
+# String constants kept for backwards compatibility with renderer
+# (main.py uses these to draw cells by string status from known_cells)
+# ---------------------------------------------------------------------------
 
 CELL_UNKNOWN = 'unknown'
 CELL_EMPTY   = 'empty'
 CELL_WALL    = 'wall'
 CELL_MINE    = 'mine'
 
+# Mapping from CellStatus enum → string for renderer compatibility
+_STATUS_TO_STR = {
+    CellStatus.UNKNOWN       : CELL_UNKNOWN,
+    CellStatus.OBSERVED_SAFE : CELL_EMPTY,
+    CellStatus.OBSERVED_WALL : CELL_WALL,
+    CellStatus.OBSERVED_MINE : CELL_MINE,
+    CellStatus.INFERRED_SAFE : CELL_EMPTY,   # treat as empty for rendering
+    CellStatus.INFERRED_MINE : CELL_MINE,    # treat as mine for rendering
+}
+
 
 class GridWorld:
+    """
+    Ground-truth grid environment.
+
+    Public attributes (ground truth — DO NOT READ from robot logic):
+        walls       : set of (r,c) cells that are walls
+        mines       : set of (r,c) cells that are mines
+        rows, cols  : grid dimensions
+
+    Public attributes (agent knowledge — safe to use everywhere):
+        knowledge   : AgentKnowledge instance shared by all robots
+
+    Backward-compatible properties (used by renderer / game.py):
+        known_cells : dict view of knowledge.cells as legacy string values
+        known_clues : dict view of knowledge.clues
+    """
+
     ROWS = 15
     COLS = 15
 
-    def __init__(self, seed=None):
+    def __init__(self, seed: Optional[int] = None):
         if seed is not None:
             random.seed(seed)
 
         self.rows = self.ROWS
         self.cols = self.COLS
 
-        # Hidden ground truth
-        self.walls  = set()   # (r,c) cells that are walls
-        self.mines  = set()   # (r,c) cells that are mines
-        self._mine_clues = {} # (r,c) -> int (hidden adjacency count)
+        # ── Ground truth (NEVER accessed by robot decision logic) ──
+        self.walls: Set[Tuple[int, int]] = set()
+        self.mines: Set[Tuple[int, int]] = set()
+        self._mine_clues = {}  # (r,c) -> int, hidden adjacency count
 
-        # Shared knowledge — updated by discover()
-        self.known_cells  = {}  # (r,c) -> 'empty' | 'wall' | 'mine'
-        self.known_clues  = {}  # (r,c) -> int
-        self._prob_cache  = {}  # (r,c) -> float, rebuilt on demand
-        self._prob_dirty  = True
+        # ── Agent knowledge (the ONLY source for robot reasoning) ──
+        # mine_prior = 0.05 matches the ~5% mine density used in _place_mines().
+        # This is an explicit configurable environment rule, not a hidden count.
+        self.knowledge = AgentKnowledge(self.rows, self.cols, mine_prior=0.05)
+
+        # Trail rendering support (populated during simulation)
+        self.visited = collections.defaultdict(set)  # (r,c) -> set of robot colors
 
         self._generate_walls()
         self._place_mines()
         self._compute_clues()
+
+    # ------------------------------------------------------------------
+    # Backward-compatible properties for renderer / game.py
+    # ------------------------------------------------------------------
+
+    @property
+    def known_cells(self):
+        """
+        Dict view: (r,c) -> legacy string status.
+        Used by main.py renderer which predates the CellStatus enum.
+        Always reflects the AgentKnowledge state.
+        """
+        return {cell: _STATUS_TO_STR[st]
+                for cell, st in self.knowledge.cells.items()}
+
+    @property
+    def known_clues(self):
+        """Dict view of knowledge.clues for renderer compatibility."""
+        return self.knowledge.clues
 
     # ------------------------------------------------------------------
     # Generation
@@ -63,14 +138,11 @@ class GridWorld:
     def _generate_walls(self):
         """
         Rejection-sampling wall placement.
-        Tries to add walls to create natural bottlenecks and corridors.
-        Each candidate is rejected if it disconnects the passability graph.
+        Each candidate wall is rejected if it would disconnect the passability graph.
+        Target: ~15% wall density, creating natural corridors.
         """
         target = int(self.rows * self.cols * 0.15)
-        all_cells = self._all_cells()
-
-        # Shuffle candidate cells
-        candidates = all_cells[:]
+        candidates = self._all_cells()[:]
         random.shuffle(candidates)
 
         attempts = 0
@@ -81,24 +153,28 @@ class GridWorld:
                 break
             attempts += 1
 
-            r, c = cell
             self.walls.add(cell)
             passable = self._passable_set()
             if not is_fully_connected(passable, self.rows, self.cols):
                 self.walls.discard(cell)  # reject — would disconnect grid
 
-        # Verify connectivity one final time
         passable = self._passable_set()
         assert is_fully_connected(passable, self.rows, self.cols), \
             "Wall generation produced disconnected grid — should not happen."
 
     def _place_mines(self):
+        """
+        Place mines on ~5% of passable cells.
+        Mine density is an explicit environment parameter (not a secret).
+        Robots are given the mine_prior=0.05 in AgentKnowledge which matches this.
+        """
         passable = [cell for cell in self._all_cells() if cell not in self.walls]
         mine_count = max(4, int(len(passable) * 0.05))
         self.mines = set(random.sample(passable, min(mine_count, len(passable))))
 
     def _compute_clues(self):
-        """Pre-compute mine-adjacency numbers for all non-mine, non-wall cells."""
+        """Pre-compute hidden mine-adjacency numbers for all non-mine, non-wall cells."""
+        self._mine_clues = {}
         for r, c in self._all_cells():
             if (r, c) in self.walls or (r, c) in self.mines:
                 continue
@@ -132,142 +208,108 @@ class GridWorld:
         return list(self._neighbors4(r, c))
 
     # ------------------------------------------------------------------
-    # Knowledge query (uses hidden ground truth)
+    # Ground-truth queries — ONLY for physics/rendering/oracle metrics
     # ------------------------------------------------------------------
 
-    def is_wall(self, r, c):
+    def is_wall(self, r, c) -> bool:
+        """[GROUND TRUTH] True if (r,c) is a wall. DO NOT call from robot logic."""
         return (r, c) in self.walls
 
-    def is_mine(self, r, c):
+    def is_mine(self, r, c) -> bool:
+        """[GROUND TRUTH] True if (r,c) is a mine. DO NOT call from robot logic."""
         return (r, c) in self.mines
 
-    def is_passable_true(self, r, c):
-        """Ground truth — only used internally or for stats."""
+    def is_passable_true(self, r, c) -> bool:
+        """[GROUND TRUTH] True if cell is passable. Use only for stats/oracle."""
         return (r, c) not in self.walls and (r, c) not in self.mines
 
-    def get_cell_status(self, r, c):
-        """Return known status of cell, or CELL_UNKNOWN."""
-        return self.known_cells.get((r, c), CELL_UNKNOWN)
+    def get_cell_status(self, r, c) -> str:
+        """Legacy string status for a cell.  Delegates to AgentKnowledge."""
+        st = self.knowledge.get_status(r, c)
+        return _STATUS_TO_STR[st]
 
     # ------------------------------------------------------------------
-    # Discovery  (called when a robot enters/scans a cell)
+    # Discovery — physics engine updates AgentKnowledge here
     # ------------------------------------------------------------------
 
-    def discover(self, r, c):
+    def discover(self, r, c) -> bool:
         """
-        Reveal cell (r,c) and its immediately adjacent walls to shared knowledge.
-        Returns True if the cell is a mine (triggers explosion).
+        Reveal what is at cell (r,c) when a robot physically enters it.
+
+        This method is allowed to read ground truth (self.walls, self.mines)
+        because it is the physics simulation — it determines what actually
+        happens when a robot steps on a cell.
+
+        Updates AgentKnowledge accordingly.
+
+        Returns:
+            True  if the cell is a mine (robot is killed).
+            False otherwise.
         """
         cell = (r, c)
 
         if (r, c) in self.walls:
-            self.known_cells[cell] = CELL_WALL
+            # Robots shouldn't enter walls, but handle it gracefully
+            self.knowledge.mark_observed_wall(r, c)
             return False
 
         if (r, c) in self.mines:
-            self.known_cells[cell] = CELL_MINE
-            # Reveal clues for all 8 neighbours immediately
+            self.knowledge.mark_observed_mine(r, c)
+            # Reveal clue numbers for all 8 neighbours (standard Minesweeper rule)
             for nr, nc in self._neighbors8(r, c):
                 nb = (nr, nc)
                 if nb not in self.walls and nb not in self.mines:
                     if nb in self._mine_clues:
-                        self.known_clues[nb] = self._mine_clues[nb]
-                    if nb not in self.known_cells:
-                        pass  # don't auto-reveal, just flag the clue
-            self._prob_dirty = True
-            return True  # mine hit!
+                        self.knowledge.clues[nb] = self._mine_clues[nb]
+            # Run constraint propagation in case we can deduce new info
+            self.knowledge.propagate_constraints()
+            return True  # mine hit — robot dies
 
-        # Normal empty cell
-        self.known_cells[cell] = CELL_EMPTY
-        if cell in self._mine_clues:
-            self.known_clues[cell] = self._mine_clues[cell]
+        # Normal safe cell
+        clue = self._mine_clues.get(cell)
+        self.knowledge.mark_observed_safe(r, c, clue=clue)
 
-        # Line-of-sight: discover adjacent walls so robots don't walk into them
+        # Line-of-sight: reveal adjacent walls so robots don't walk into them
         for nr, nc in self._neighbors4(r, c):
             nb = (nr, nc)
-            if nb in self.walls and nb not in self.known_cells:
-                self.known_cells[nb] = CELL_WALL
+            if nb in self.walls:
+                self.knowledge.mark_observed_wall(nr, nc)
 
-        self._prob_dirty = True
+        # Run constraint propagation after each discovery
+        self.knowledge.propagate_constraints()
         return False
 
     def scan_adjacent(self, r, c):
         """
-        Scan all 4-neighbours of (r,c) and reveal their wall/mine status.
-        Called at the start of each robot turn so they get good local info.
+        Scan 4-neighbours of (r,c) and reveal their wall status.
+        Called at start of each robot turn for local awareness.
+        Does NOT reveal mines — only physical entry reveals a mine.
         """
         for nr, nc in self._neighbors4(r, c):
-            nb = (nr, nc)
-            if nb in self.walls and nb not in self.known_cells:
-                self.known_cells[nb] = CELL_WALL
-            # Do NOT automatically reveal mines — only when stepped on
+            if (nr, nc) in self.walls:
+                self.knowledge.mark_observed_wall(nr, nc)
 
     # ------------------------------------------------------------------
-    # Mine probability estimation (Minesweeper-style)
+    # Mine probability (delegates to AgentKnowledge)
     # ------------------------------------------------------------------
 
-    def get_mine_probability(self, r, c):
+    def get_mine_probability(self, r, c) -> float:
         """
-        Estimate probability that (r,c) is a mine using:
-          - If cell is known → definitive answer.
-          - If neighbour clues constrain it → use clue-based reasoning.
-          - Otherwise → base rate: remaining_mines / unrevealed_cells.
+        Estimate P(mine at (r,c) | agent knowledge).
+
+        Delegates entirely to AgentKnowledge.get_mine_probability().
+        No ground-truth information is used here.
         """
-        cell = (r, c)
-        status = self.known_cells.get(cell)
-        if status == CELL_MINE:
-            return 1.0
-        if status in (CELL_WALL, CELL_EMPTY):
-            return 0.0  # walls are blocked; empty cells are confirmed safe
-
-        # Count known mines and unrevealed cells
-        all_cells = self._all_cells()
-        known_mines = sum(1 for s in self.known_cells.values() if s == CELL_MINE)
-        remaining_mines = max(0, len(self.mines) - known_mines)
-        unrevealed = [c2 for c2 in all_cells
-                      if self.known_cells.get(c2, CELL_UNKNOWN) == CELL_UNKNOWN
-                      and c2 not in self.walls]
-        if not unrevealed:
-            return 0.0
-
-        base_prob = remaining_mines / len(unrevealed)
-
-        # Refine using adjacent clue constraints
-        # If any revealed neighbour has a clue and this cell is one of its unknowns:
-        constraint_probs = []
-        for nr, nc in self._neighbors8(r, c):
-            nb = (nr, nc)
-            clue = self.known_clues.get(nb)
-            if clue is None:
-                continue
-            # Count how many unknown neighbours THIS clue cell has
-            nb_unknowns = [
-                (xr, xc) for xr, xc in self._neighbors8(nr, nc)
-                if self.known_cells.get((xr, xc), CELL_UNKNOWN) == CELL_UNKNOWN
-                and (xr, xc) not in self.walls
-            ]
-            nb_known_mines = sum(
-                1 for xr, xc in self._neighbors8(nr, nc)
-                if self.known_cells.get((xr, xc)) == CELL_MINE
-            )
-            mines_left = max(0, clue - nb_known_mines)
-            if nb_unknowns:
-                p = mines_left / len(nb_unknowns)
-                constraint_probs.append(min(1.0, p))
-
-        if constraint_probs:
-            # Take max of constraint-based estimates (conservative)
-            return max(base_prob, max(constraint_probs))
-
-        return base_prob
+        return self.knowledge.get_mine_probability(r, c)
 
     # ------------------------------------------------------------------
-    # Helpers for robot starting positions
+    # Robot starting positions
     # ------------------------------------------------------------------
 
     def random_passable_cells(self, n, exclude=None):
         """
-        Return n random cells that are passable (not wall, not mine, not in exclude).
+        Return n random cells that are passable (not wall, not mine, not excluded).
+        [GROUND TRUTH] — used only for placing robots at round start, not for AI.
         """
         exclude = set(exclude or [])
         candidates = [
@@ -275,11 +317,17 @@ class GridWorld:
             if cell not in self.walls and cell not in self.mines and cell not in exclude
         ]
         if len(candidates) < n:
-            raise ValueError(f"Not enough passable cells ({len(candidates)}) to place {n} agents.")
+            raise ValueError(
+                f"Not enough passable cells ({len(candidates)}) to place {n} agents."
+            )
         return random.sample(candidates, n)
 
-    def count_mines(self):
+    # ------------------------------------------------------------------
+    # Stats helpers
+    # ------------------------------------------------------------------
+
+    def count_mines(self) -> int:
         return len(self.mines)
 
-    def count_walls(self):
+    def count_walls(self) -> int:
         return len(self.walls)

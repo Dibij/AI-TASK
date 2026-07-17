@@ -2,15 +2,25 @@
 main.py — Pygame renderer and game loop for the Multi-Agent Pathfinding Simulation.
 
 Layout: 1100 × 700 px
-  Left  680 px  : Grid panel (10x10 grid, 56px cells)
+  Left  680 px  : Grid panel (15×15 grid, 40px cells)
   Right 420 px  : Stats / log sidebar
 
 Controls:
-  SPACE      : advance to next round (when current round is over)
+  SPACE      : toggle play/pause
   R          : full reset (new world, new robots)
+  LEFT/RIGHT : step through history (while paused)
   +  / =     : speed up simulation
   -          : slow down simulation
   ESC        : quit
+
+Architecture notes:
+  - The renderer reads from game.world.known_cells (AgentKnowledge string view)
+    which contains only what the robots have discovered.
+  - Hidden mines are rendered as faint circles for debugging purposes;
+    this visual aid is clearly marked as a debug overlay.
+  - Trajectory prediction circles show SHORT-HORIZON DETERMINISTIC predictions,
+    not probabilistic collision probabilities.
+  - Sidebar stats correctly separate mine deaths from collision deaths.
 """
 
 import sys
@@ -126,7 +136,6 @@ class Renderer:
             if os.path.exists(path):
                 try:
                     img = pygame.image.load(path).convert_alpha()
-                    # Apply colorkey to remove white background
                     img_surface = pygame.Surface(img.get_size(), pygame.SRCALPHA)
                     img_surface.fill((255, 255, 255))
                     img.set_colorkey((255, 255, 255))
@@ -141,18 +150,13 @@ class Renderer:
         world  = game.world
         robots = game.robots
 
-        # Build robot position lookup
-        robot_at = {}
-        for r in robots:
-            if r.alive and not r.reached:
-                robot_at[r.pos] = r
-            if r.reached:
-                robot_at.get(r.pos)  # keep target highlight
+        # known_cells is the backward-compatible string-view of AgentKnowledge
+        kc = world.known_cells
 
         for row in range(world.rows):
             for col in range(world.cols):
                 cell   = (row, col)
-                status = world.known_cells.get(cell, CELL_UNKNOWN)
+                status = kc.get(cell, CELL_UNKNOWN)
                 rect   = cell_rect(row, col)
 
                 # ── Cell background ──
@@ -166,44 +170,49 @@ class Renderer:
                     bg = C_UNKNOWN
 
                 pygame.draw.rect(self.screen, bg, rect)
-                
+
                 # ── Visited Path Rendering ──
                 if status == CELL_EMPTY and hasattr(world, 'visited') and cell in world.visited:
                     visitors = list(world.visited[cell])
                     n = len(visitors)
                     if n > 0:
-                        # Draw split rects
                         w = CELL_PX / n
                         for i, color in enumerate(visitors):
-                            sub_rect = pygame.Rect(rect.left + int(i * w), rect.top, int(w), CELL_PX)
-                            # Draw with alpha blending
+                            sub_rect = pygame.Rect(
+                                rect.left + int(i * w), rect.top, int(w), CELL_PX
+                            )
                             s = pygame.Surface((sub_rect.width, sub_rect.height), pygame.SRCALPHA)
-                            s.fill((color[0], color[1], color[2], 100))  # Semi-transparent
+                            s.fill((color[0], color[1], color[2], 100))
                             self.screen.blit(s, sub_rect.topleft)
 
                 pygame.draw.rect(self.screen, C_GRID_LINE, rect, 1)
 
                 # ── Coordinate Label ──
                 coord_surf = self.f_console.render(f"{row},{col}", True, (80, 90, 110))
-                self.screen.blit(coord_surf, (rect.right - coord_surf.get_width() - 2, rect.bottom - coord_surf.get_height() - 2))
+                self.screen.blit(
+                    coord_surf,
+                    (rect.right - coord_surf.get_width() - 2,
+                     rect.bottom - coord_surf.get_height() - 2)
+                )
 
                 # ── Mine probability heat on unknown cells ──
                 if status == CELL_UNKNOWN:
                     p = world.get_mine_probability(row, col)
                     if p > 0.05:
-                        heat = lerp_color((42, 56, 78), (220, 38, 38), min(1, p * 2))
+                        heat  = lerp_color((42, 56, 78), (220, 38, 38), min(1, p * 2))
                         dot_r = max(3, int(CELL_PX * 0.18 * p))
                         pygame.draw.circle(self.screen, heat, rect.center, dot_r)
 
                 # ── Minesweeper clue number ──
                 clue = world.known_clues.get(cell)
                 if clue and status == CELL_EMPTY:
-                    clue_surf = self.f_clue.render(str(clue), True,
-                                                   CLUE_COLORS.get(clue, TEXT_MUTED))
+                    clue_surf = self.f_clue.render(
+                        str(clue), True, CLUE_COLORS.get(clue, TEXT_MUTED)
+                    )
                     clue_rect = clue_surf.get_rect(center=rect.center)
                     self.screen.blit(clue_surf, clue_rect)
 
-                # ── Mine skull icon ──
+                # ── Mine icon for revealed mines ──
                 if status == CELL_MINE:
                     cx, cy = rect.center
                     r2 = CELL_PX // 5
@@ -212,13 +221,18 @@ class Renderer:
                         pygame.draw.line(self.screen, (30, 15, 5),
                                          (cx, cy), (cx + dx*r2, cy + dy*r2), 2)
 
-        # ── Draw Hidden Mines (Dimly) ──
+        # ── Debug: Draw Hidden Mines (Dimly) ──
+        # This is a VISUAL DEBUG OVERLAY ONLY.  The robots cannot see these.
+        # They are drawn faintly so the player can evaluate robot decisions.
         for mr, mc in world.mines:
-            status = world.known_cells.get((mr, mc))
+            status = kc.get((mr, mc))
             if status != CELL_MINE:
                 m_rect = cell_rect(mr, mc)
                 s = pygame.Surface((CELL_PX, CELL_PX), pygame.SRCALPHA)
-                pygame.draw.circle(s, (200, 30, 30, 40), (CELL_PX // 2, CELL_PX // 2), CELL_PX // 4)
+                pygame.draw.circle(
+                    s, (200, 30, 30, 40),
+                    (CELL_PX // 2, CELL_PX // 2), CELL_PX // 4
+                )
                 self.screen.blit(s, m_rect.topleft)
 
         # ── Target markers ──
@@ -226,12 +240,9 @@ class Renderer:
             if robot.target:
                 tr, tc  = robot.target
                 t_rect  = cell_rect(tr, tc)
-                # Draw a pulsing ring around target
                 pulse   = abs(math.sin(time.time() * 3)) * 3
                 ring_r  = int(CELL_PX // 2 - 4 + pulse)
-                pygame.draw.circle(self.screen, robot.color,
-                                   t_rect.center, ring_r, 2)
-                # Small diamond
+                pygame.draw.circle(self.screen, robot.color, t_rect.center, ring_r, 2)
                 cx, cy = t_rect.center
                 d = 5
                 pygame.draw.polygon(self.screen, robot.color, [
@@ -247,10 +258,9 @@ class Renderer:
                 for i in range(len(path) - 1):
                     ax, ay = cell_center(*path[i])
                     bx, by = cell_center(*path[i + 1])
-                    # Draw dashed segment
-                    dx, dy  = bx - ax, by - ay
-                    dist    = max(1, math.hypot(dx, dy))
-                    steps   = max(1, int(dist / 6))
+                    dx, dy = bx - ax, by - ay
+                    dist   = max(1, math.hypot(dx, dy))
+                    steps  = max(1, int(dist / 6))
                     for j in range(steps):
                         if j % 2 == 0:
                             px = int(ax + dx * j / steps)
@@ -259,7 +269,9 @@ class Renderer:
                             pygame.draw.circle(alpha_surf, (*robot.color, 120), (2, 2), 2)
                             self.screen.blit(alpha_surf, (px - 2, py - 2))
 
-        # ── Predicted positions (faded circles, horizon 3 steps) ──
+        # ── Predicted positions (faded circles, 3-step horizon) ──
+        # NOTE: These are SHORT-HORIZON DETERMINISTIC TRAJECTORY PREDICTIONS,
+        # not probabilistic collision probabilities.
         for robot in robots:
             if not robot.alive:
                 continue
@@ -269,8 +281,10 @@ class Renderer:
                 for (pr, pc) in cells:
                     cx2, cy2 = cell_center(pr, pc)
                     s = pygame.Surface((CELL_PX, CELL_PX), pygame.SRCALPHA)
-                    pygame.draw.circle(s, (*robot.color, alpha),
-                                       (CELL_PX // 2, CELL_PX // 2), CELL_PX // 4)
+                    pygame.draw.circle(
+                        s, (*robot.color, alpha),
+                        (CELL_PX // 2, CELL_PX // 2), CELL_PX // 4
+                    )
                     self.screen.blit(s, (cx2 - CELL_PX // 2, cy2 - CELL_PX // 2))
 
         # ── Robots ──
@@ -282,7 +296,6 @@ class Renderer:
             radius = CELL_PX // 2 - 5
 
             if not robot.alive:
-                # Draw 'X' for dead robot
                 pygame.draw.line(self.screen, TEXT_DANGER,
                                  (cx - radius, cy - radius), (cx + radius, cy + radius), 3)
                 pygame.draw.line(self.screen, TEXT_DANGER,
@@ -291,11 +304,10 @@ class Renderer:
 
             # Shadow
             shadow_surf = pygame.Surface((radius * 2 + 4, radius * 2 + 4), pygame.SRCALPHA)
-            pygame.draw.circle(shadow_surf, (0, 0, 0, 60),
-                               (radius + 2, radius + 3), radius)
+            pygame.draw.circle(shadow_surf, (0, 0, 0, 60), (radius + 2, radius + 3), radius)
             self.screen.blit(shadow_surf, (cx - radius - 2, cy - radius - 2))
 
-            # Body (Sprite or Fallback Circle)
+            # Body
             sprite = getattr(self, "sprites", {}).get(robot.id)
             if sprite:
                 self.screen.blit(sprite, (cx - radius, cy - radius))
@@ -303,7 +315,7 @@ class Renderer:
                 pygame.draw.circle(self.screen, robot.color, (cx, cy), radius)
                 pygame.draw.circle(self.screen, TEXT_LIGHT, (cx, cy), radius, 2)
 
-            # ID label (Draw small in top left so it doesn't cover the sprite too much)
+            # ID label
             id_surf = self.f_cell.render(robot.name[0], True, TEXT_LIGHT)
             id_rect = id_surf.get_rect(center=(cx, cy))
             self.screen.blit(id_surf, id_rect)
@@ -321,7 +333,7 @@ class Renderer:
     # ── Sidebar ─────────────────────────────────────────────────────────
 
     def draw_sidebar(self, game, tps, paused=False):
-        sb_x   = GRID_PANEL_W
+        sb_x    = GRID_PANEL_W
         sb_rect = pygame.Rect(sb_x, 0, SIDEBAR_W, WIN_H)
         pygame.draw.rect(self.screen, SIDEBAR_BG, sb_rect)
         pygame.draw.line(self.screen, DIVIDER, (sb_x, 0), (sb_x, WIN_H), 2)
@@ -333,7 +345,7 @@ class Renderer:
         t = self.f_title.render("Multi-Agent Pathfinding", True, TEXT_LIGHT)
         self.screen.blit(t, (x, y))
         y += 26
-        sub = self.f_sub.render("Competitive Incomplete-Information Explorer", True, TEXT_MUTED)
+        sub = self.f_sub.render("Risk-Aware · Partial Obs. · A* Planner", True, TEXT_MUTED)
         self.screen.blit(sub, (x, y))
         y += 22
 
@@ -341,23 +353,21 @@ class Renderer:
         y += 10
 
         # ── Round info ──
-        round_str = f"Round {game.round_number} / {MAX_ROUNDS}"
+        round_str = f"Round {game.round_number} / {game.max_rounds}"
         if game.tournament_over:
-            round_str = f"Tournament Complete!"
+            round_str = "Tournament Complete!"
         r_surf = self.f_sub.render(round_str, True, TEXT_WARNING)
         self.screen.blit(r_surf, (x, y))
 
-        # Round progress bar
-        bar_w = SIDEBAR_W - 32
+        bar_w    = SIDEBAR_W - 32
         bar_rect = pygame.Rect(x, y + 18, bar_w, 8)
         pygame.draw.rect(self.screen, PANEL_BG, bar_rect, border_radius=4)
-        prog = min(1.0, game.round_number / MAX_ROUNDS)
+        prog = min(1.0, game.round_number / game.max_rounds)
         if prog > 0:
             fill = pygame.Rect(x, y + 18, int(bar_w * prog), 8)
             pygame.draw.rect(self.screen, (59, 130, 246), fill, border_radius=4)
         y += 36
 
-        # Tick counter & speed
         status_str = f"Tick {game.tick}"
         if game.round_over and not game.tournament_over:
             status_str += "  — SPACE for next round"
@@ -372,7 +382,7 @@ class Renderer:
         # Play/Pause button
         self.play_pause_rect = pygame.Rect(x, y, 100, 24)
         btn_color = TEXT_SUCCESS if paused else TEXT_WARNING
-        btn_text = "▶ PLAY" if paused else "⏸ PAUSE"
+        btn_text  = "▶ PLAY" if paused else "⏸ PAUSE"
         draw_rounded_rect(self.screen, btn_color, self.play_pause_rect, radius=4)
         t_surf = self.f_sub.render(btn_text, True, BG)
         t_rect = t_surf.get_rect(center=self.play_pause_rect.center)
@@ -390,19 +400,15 @@ class Renderer:
         for robot in game.leaderboard():
             eff  = game.avg_efficiency(robot)
             surv = game.survival_rate(robot)
-            wait = game.avg_wait(robot)
 
-            # Row background
-            row_rect = pygame.Rect(x - 4, y - 2, SIDEBAR_W - 28, 48)
+            row_rect = pygame.Rect(x - 4, y - 2, SIDEBAR_W - 28, 52)
             draw_rounded_rect(self.screen, PANEL_BG, row_rect, radius=5,
                               border=1, border_color=DIVIDER)
 
-            # Color indicator
             pygame.draw.circle(self.screen, robot.color, (x + 12, y + 12), 10)
             id_surf = self.f_sub.render(robot.name[0], True, TEXT_LIGHT)
             self.screen.blit(id_surf, id_surf.get_rect(center=(x + 12, y + 12)))
 
-            # Stats text
             name_surf = self.f_sub.render(
                 f"{robot.name}  "
                 f"spd={'fast' if robot.speed == 2 else 'slow'}  "
@@ -411,7 +417,6 @@ class Renderer:
             )
             self.screen.blit(name_surf, (x + 28, y + 2))
 
-            # Efficiency bar
             eff_bar_w = SIDEBAR_W - 80
             eff_bg    = pygame.Rect(x + 28, y + 20, eff_bar_w, 7)
             pygame.draw.rect(self.screen, DIVIDER, eff_bg, border_radius=3)
@@ -420,15 +425,18 @@ class Renderer:
             if eff > 0:
                 pygame.draw.rect(self.screen, eff_color, eff_fill, border_radius=3)
 
+            # Show separate death types: mine vs collision
+            mine_d  = robot.total_mine_deaths
+            coll_d  = robot.total_collision_deaths
             stats_str = (
                 f"eff={eff:.2f}  surv={surv:.0%}  "
-                f"wins={robot.total_wins}  deaths={robot.total_deaths}  "
-                f"avgwait={wait:.1f}"
+                f"wins={robot.total_wins}  "
+                f"mine✗={mine_d}  coll✗={coll_d}"
             )
             st_surf = self.f_console.render(stats_str, True, TEXT_MUTED)
             self.screen.blit(st_surf, (x + 28, y + 32))
 
-            y += 54
+            y += 58
 
         pygame.draw.line(self.screen, DIVIDER, (sb_x + 10, y), (WIN_W - 10, y), 1)
         y += 10
@@ -441,7 +449,7 @@ class Renderer:
             tr_str = (
                 f"{robot.name}: spd={robot.speed} "
                 f"risk={robot.risk_tolerance:.0%} "
-                f"patience={robot.patience:.0%}"
+                f"pat={robot.patience:.0%}"
             )
             tr_surf = self.f_console.render(tr_str, True, robot.color)
             self.screen.blit(tr_surf, (x, y))
@@ -460,13 +468,11 @@ class Renderer:
         draw_rounded_rect(self.screen, PANEL_BG, log_rect, radius=5,
                           border=1, border_color=DIVIDER)
 
-        # Clip to log area
         self.screen.set_clip(log_rect)
         line_h    = 15
         max_lines = log_area_h // line_h
         log       = game.log
 
-        # Scroll
         max_scroll = max(0, len(log) - max_lines)
         self.log_scroll = min(self.log_scroll, max_scroll)
         start_i   = max(0, len(log) - max_lines - self.log_scroll)
@@ -474,7 +480,6 @@ class Renderer:
         visible   = log[start_i:end_i]
 
         for i, msg in enumerate(visible):
-            # Colour-code based on content
             if "MINE" in msg or "💥" in msg:
                 color = TEXT_DANGER
             elif "✅" in msg or "reached" in msg:
@@ -488,16 +493,14 @@ class Renderer:
 
         self.screen.set_clip(None)
 
-        # Scroll hint
         if len(log) > max_lines:
             hint = self.f_console.render(
                 f"{start_i+1}–{end_i}/{len(log)} (scroll wheel)", True, TEXT_MUTED
             )
             self.screen.blit(hint, (x, WIN_H - 30))
 
-        # Controls footer
         ctrl = self.f_console.render(
-            "SPACE=next round  R=reset  +/-=speed  ESC=quit", True, TEXT_MUTED
+            "SPACE=play/pause  R=reset  +/-=speed  ESC=quit", True, TEXT_MUTED
         )
         self.screen.blit(ctrl, (x, WIN_H - 16))
 
@@ -508,41 +511,41 @@ class Renderer:
             self.log_scroll = max(0, self.log_scroll - 2)
 
     def draw_tooltip(self, robot, mx, my, all_robots):
-        optimal = getattr(robot, '_shortest_known', '?')
+        oracle = getattr(robot, '_shortest_oracle', '?')
         lines = [
-            f"{robot.name}",
-            f"Speed: {robot.speed}",
-            f"Steps: {robot.steps_taken} / Optimal: {optimal}",
-            f"Risk Tolerance: {robot.risk_tolerance:.0%}",
-            f"Patience: {robot.patience:.0%}",
-            f"Wait Counter: {robot.wait_counter}",
-            f"Pos: {robot.pos} -> Target: {robot.target}",
-            f"State: {'Alive' if robot.alive else 'Dead'} {'(Reached)' if robot.reached else ''}"
+            f"{robot.name}  [{robot._planner_name}]",
+            f"Speed: {robot.speed}   Risk tol: {robot.risk_tolerance:.0%}",
+            f"Steps: {robot.steps_taken}  /  Oracle: {oracle}",
+            f"Waits: {robot.waits_taken}  Replans: {robot.replans_taken}",
+            f"Unknown cells entered: {robot.unknown_cells_entered}",
+            f"Pos: {robot.pos} → Target: {robot.target}",
+            f"State: {'Alive' if robot.alive else 'Dead (mine)' if robot.hit_mine else 'Dead (collision)' if robot.hit_robot else 'Dead'} "
+            f"{'(Reached)' if robot.reached else ''}"
         ]
-        
+
+        # Short-horizon trajectory predictions (not probabilistic)
         preds = robot.predict_others(all_robots, horizon=3)
         if any(preds.values()):
-            lines.append("Predictions (horizon 3):")
+            lines.append("Trajectory predictions (horizon 3):")
             for step, cells in preds.items():
                 if cells:
                     lines.append(f"  T+{step}: {list(cells)}")
-        
+
         surfs = [self.f_ui.render(line, True, TEXT_LIGHT) for line in lines]
         w = max(s.get_width() for s in surfs) + 16
         h = sum(s.get_height() for s in surfs) + 16
-        
+
         rect = pygame.Rect(mx + 12, my + 12, w, h)
         if rect.right > WIN_W:
             rect.right = mx - w - 12
         if rect.bottom > WIN_H:
             rect.bottom = my - h - 12
-            
-        # Draw semi-transparent background
+
         bg_surf = pygame.Surface((w, h), pygame.SRCALPHA)
         pygame.draw.rect(bg_surf, (20, 25, 40, 240), bg_surf.get_rect(), border_radius=6)
         pygame.draw.rect(bg_surf, DIVIDER, bg_surf.get_rect(), 1, border_radius=6)
         self.screen.blit(bg_surf, rect)
-        
+
         cy = rect.y + 8
         for s in surfs:
             self.screen.blit(s, (rect.x + 8, cy))
@@ -555,7 +558,7 @@ class Renderer:
         overlay.fill((10, 15, 28, 200))
         self.screen.blit(overlay, (0, 0))
 
-        winner = game.leaderboard()[0]
+        winner    = game.leaderboard()[0]
         title_surf = self.f_big.render("🏆 Tournament Complete!", True, TEXT_WARNING)
         self.screen.blit(title_surf,
                          title_surf.get_rect(center=(GRID_PANEL_W // 2, WIN_H // 2 - 60)))
@@ -577,22 +580,22 @@ class Renderer:
 
 def main():
     pygame.init()
-    pygame.display.set_caption("Multi-Agent Pathfinding Simulation — AI Engine")
+    pygame.display.set_caption(
+        "Multi-Agent Pathfinding Simulation — Risk-Aware A* with Partial Observability"
+    )
     screen = pygame.display.set_mode((WIN_W, WIN_H))
     clock  = pygame.time.Clock()
 
-    game     = Game()
+    game     = Game()  # default: risk_aware planner, random seed
     renderer = Renderer(screen)
-    tps      = 1
+    tps      = DEFAULT_TPS
 
-    paused   = True  # start paused
-
+    paused         = True
     last_tick_time = time.time()
-    auto_advance   = False   # auto-start next round 2s after round ends
     round_end_time = None
-    
+
     import copy
-    history = [copy.deepcopy(game)]
+    history       = [copy.deepcopy(game)]
     history_index = 0
 
     print("[MAPF] Simulation started.")
@@ -601,7 +604,8 @@ def main():
           f"Mines: {game.world.count_mines()}")
     for r in game.robots:
         print(f"[MAPF] {r.name}: speed={r.speed}  "
-              f"risk={r.risk_tolerance:.2f}  patience={r.patience:.2f}")
+              f"risk={r.risk_tolerance:.2f}  patience={r.patience:.2f}  "
+              f"planner={r._planner_name}")
 
     while True:
         # ── Events ────────────────────────────────────────────────────
@@ -616,8 +620,8 @@ def main():
                     sys.exit()
 
                 elif event.key == pygame.K_r:
-                    game = Game()
-                    history = [copy.deepcopy(game)]
+                    game          = Game()
+                    history       = [copy.deepcopy(game)]
                     history_index = 0
                     renderer.log_scroll = 0
                     last_tick_time = time.time()
@@ -626,20 +630,27 @@ def main():
 
                 elif event.key == pygame.K_SPACE:
                     paused = not paused
-                    
+
                 elif event.key == pygame.K_LEFT:
-                    paused = True
+                    paused        = True
                     history_index = max(0, history_index - 1)
-                    game = history[history_index]
-                    
+                    game          = history[history_index]
+
                 elif event.key == pygame.K_RIGHT:
-                    paused = True
+                    paused        = True
                     history_index = min(len(history) - 1, history_index + 1)
-                    game = history[history_index]
+                    game          = history[history_index]
+
+                elif event.key in (pygame.K_PLUS, pygame.K_EQUALS):
+                    tps = min(MAX_TPS, tps + 1)
+
+                elif event.key == pygame.K_MINUS:
+                    tps = max(MIN_TPS, tps - 1)
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
-                    if hasattr(renderer, "play_pause_rect") and renderer.play_pause_rect.collidepoint(event.pos):
+                    if (hasattr(renderer, "play_pause_rect")
+                            and renderer.play_pause_rect.collidepoint(event.pos)):
                         paused = not paused
                 elif event.button == 4:
                     renderer.handle_scroll(1, len(game.log))
@@ -648,24 +659,24 @@ def main():
 
         # ── Simulation Tick ───────────────────────────────────────────
         now = time.time()
-        if game.running and not paused and (now - last_tick_time) >= 1.0:
+        if game.running and not paused and (now - last_tick_time) >= 1.0 / tps:
             if history_index < len(history) - 1:
-                # If we resume from the past, discard alternate future
                 history = history[:history_index + 1]
-            
+
             game.tick_simulation()
             history.append(copy.deepcopy(game))
             history_index = len(history) - 1
             last_tick_time = now
 
-            # Print notable events to terminal (ASCII-safe)
+            # Print notable events to terminal
             if hasattr(game, 'tick_logs') and game.tick_logs:
                 for latest in game.tick_logs:
-                    if any(k in latest for k in ["MINE", "reached", "Round", "waiting", "stuck", "moved", "avoids", "impatient", "COLLISION"]):
+                    if any(k in latest for k in [
+                        "MINE", "reached", "Round", "waiting", "stuck",
+                        "moved", "avoids", "impatient", "COLLISION", "SWAP"
+                    ]):
                         safe = latest.encode('ascii', errors='replace').decode('ascii')
-                        
-                        # Apply ANSI color based on robot name
-                        color_code = "\033[0m" # Default reset
+                        color_code = "\033[0m"
                         if "Blue" in safe:
                             color_code = "\033[94m"
                         elif "Red" in safe:
@@ -674,21 +685,18 @@ def main():
                             color_code = "\033[92m"
                         elif "Yellow" in safe:
                             color_code = "\033[93m"
-                            
-                        # If multiple robots or special events, maybe override
                         if "COLLISION" in safe or "MINE" in safe:
-                            color_code = "\033[1;91m" # Bold Red
-                            
+                            color_code = "\033[1;91m"
                         print(f"{color_code}[MAPF] {safe}\033[0m")
 
-        # Auto-advance logic (2 second pause between rounds)
+        # Auto-advance after round ends
         if game.round_over and not game.tournament_over:
             if round_end_time is None:
                 round_end_time = time.time()
             elif time.time() - round_end_time > 2.5:
                 game.next_round()
                 renderer.log_scroll = 0
-                round_end_time = None
+                round_end_time      = None
 
         # ── Render ───────────────────────────────────────────────────
         screen.fill(BG)
