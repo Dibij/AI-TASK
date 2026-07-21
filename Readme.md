@@ -10,8 +10,9 @@ Four robots navigate a 15×15 grid world with hidden mines and walls. Each robot
 - **Partially observable**: robots only know what they've physically discovered
 - **Cooperative knowledge sharing**: all robots share one knowledge state (modelling a radio-linked swarm)
 - **Risk-aware pathfinding**: A* weighted by mine probability, unknown-cell penalty, and collision prediction
-- **Two-phase tick**: decisions are made simultaneously, then resolved — no update-order bias
+- **Five-phase tick**: strict phase separation (Observe, Update, Decide, Resolve, Apply) ensures no update-order bias
 - **Short-horizon deterministic trajectory prediction**: planned-path-based collision avoidance (not probabilistic)
+- **Priority-based conflict resolution**: collisions force waiters based on wait-time priority to prevent starvation
 
 ## Architecture
 
@@ -103,24 +104,23 @@ Each robot has three personality traits that influence behaviour:
 
 In the default `Game`, these are randomised. Controlled personality sweeps are available via `experiments.py`.
 
-## Two-Phase Tick Protocol
+## Five-Phase Tick Protocol
 
-Each simulation tick follows a two-phase protocol that eliminates update-order bias:
+Each simulation tick follows a strict five-phase protocol that eliminates update-order bias and prevents starvation:
 
-**Phase 1 — Decision:** Every alive robot calls `decide_action()` on the same world state. No state is mutated.
-
-**Phase 2 — Resolution:** Actions are applied simultaneously, then collision detection runs on the final positions:
-- Same-cell collisions (two robots land on the same cell)
-- Swap collisions (two robots exchange positions in one tick)
+**Phase 1 — Observe:** All robots simultaneously read the GridWorld and accumulate observations (mines, walls, clues). No inferences are made yet.
+**Phase 2 — Update Knowledge:** The shared `AgentKnowledge` processes all observations globally, propagating constraints and updating the probability model.
+**Phase 3 — Decide:** Every alive, unreached robot calls `decide_action()` on the synchronized knowledge state. No state is mutated. Wait-forcing risk-rejection happens here.
+**Phase 4 — Resolve Conflicts:** System detects collisions (same-cell and swap). A deterministic priority system (based on consecutive waits + starvation boost) decides the winner. Losers are forced to change their action to `WAIT`.
+**Phase 5 — Apply:** Actions (Move/Wait) are applied simultaneously. Risk relaxation triggers here if a robot is stuck avoiding a cell and runs out of options.
 
 ## Death Types
 
-The system tracks three separate death types (not conflated into one variable):
+The system tracks two separate death types (collisions no longer cause death, they cause waits):
 
 | Flag | Cause |
 |------|-------|
 | `hit_mine` | Robot stepped on a hidden mine |
-| `hit_robot` | Robot collided with another robot (incl. swaps) |
 | `timed_out` | Robot didn't reach target within MAX_TICKS (300) per round |
 
 ## Metrics
@@ -150,11 +150,12 @@ The system tracks three separate death types (not conflated into one variable):
 
 ### Configuration Comparison
 
-```
-python experiments.py --seed 42 --rounds 10 --configs A B C
+```bash
+python experiments.py --seed 42 --num-seeds 10 --configs A B C --output-dir logs/
 ```
 
-This runs a **paired comparison**: all configurations face the same sequence of worlds (same seeds). Results are written to `logs/`.
+This runs a **paired comparison**: all configurations face the exact same sequence of worlds (same seeds). 
+If interrupted, you can resume by passing `--resume logs/experiment_A_B_C_seed42_...`.
 
 | Config | Name | Description |
 |--------|------|-------------|
@@ -194,14 +195,29 @@ python main.py
 - Scroll wheel — log scrolling
 
 ### Headless Experiments
-```
-python experiments.py --seed 42 --rounds 20 --configs A B C D E
-python experiments.py --personality-sweep risk_tolerance --seed 42
+```bash
+python experiments.py --seed 42 --num-seeds 30 --configs A B C D E
+python experiments.py --personality-sweep risk_tolerance --seed 42 --num-seeds 10
+python experiments.py --resume logs/experiment_A_B_C_D_E_seed42_...
+python experiments.py --gui  # Watch the experiment run at maximum speed
 python experiments.py --help
 ```
 
+### Experiment Output Format
+Experiments write output to a uniquely timestamped directory (e.g. `logs/experiment_A_B_C_seed42_.../`) containing:
+- `meta.json`: Experiment configuration parameters.
+- `events.jsonl`: Event-level JSON Lines format. Each line represents one completed round per configuration, enabling crash recovery and incremental data processing.
+- `summary.json`: Final statistical summary including Mean, Median, StdDev, 95% Confidence Intervals, and Paired T-Test p-values against the baseline.
+
+### Pre-Experiment Checklist
+Before kicking off a massive overnight sweep, verify the following:
+1. **Tests pass:** Run `pytest tests/test_suite.py` to ensure core systems are sound.
+2. **Crash recovery:** Verify the `--resume` flag works by cancelling a short run and resuming it.
+3. **Statistical significance:** Set `--num-seeds` to a statistically meaningful value (30-50 recommended) for paired comparisons.
+4. **Scipy installed:** Ensure `scipy` is installed in your environment for T-Tests and CIs.
+
 ### Tests
-```
+```bash
 python -m pytest tests/test_suite.py -v
 ```
 

@@ -3,21 +3,25 @@ robot.py — Robot agent for the multi-agent grid-world simulation.
 
 Each robot:
   - Has a personality (speed, risk_tolerance, patience) — controllable for experiments.
-  - Uses a configurable Planner (ShortestPath / RiskAware / Conservative).
+  - Uses a configurable Planner (ShortestPath / RiskAware / variants).
   - Makes decisions from AgentKnowledge ONLY — no ground-truth access.
-  - Exposes decide_action() and apply_action() for the two-phase tick in game.py.
+  - Exposes observe(), decide_action() and apply_action() for the phased tick in game.py.
   - Tracks separate death types: mine deaths vs collision deaths vs timeouts.
+  - Tracks risk relaxation events explicitly.
+  - Tracks conflict wins/losses for fairness analysis.
 
-Two-phase tick protocol (implemented in game.py):
-  Phase 1 — Decision:
-      All robots call decide_action(snapshot) using the same world state.
-      No state is mutated.  Each robot records its intended_action.
-
-  Phase 2 — Resolution:
-      game.py resolves all intended actions simultaneously:
-        - Detects same-cell collisions and swap collisions.
-        - Applies movement and triggers discover() for new cells.
-        - Updates alive/reached/death flags.
+Five-phase tick protocol (implemented in game.py):
+  Phase 1 — Observation:
+      All robots call observe(). All observations complete before any decisions.
+  Phase 2 — Knowledge Update:
+      Constraint propagation runs once after all observations.
+  Phase 3 — Decision:
+      All robots call decide_action(snapshot) using the same knowledge state.
+      No state is mutated. Each robot records its intended_action.
+  Phase 4 — Conflict Resolution:
+      game.py resolves all intended actions simultaneously using priority policy.
+  Phase 5 — Action Application:
+      game.py applies approved actions, triggers discovery, checks hazards.
 
 Terminology note:
   predict_others() implements SHORT-HORIZON DETERMINISTIC TRAJECTORY PREDICTION.
@@ -31,6 +35,10 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from planner import make_planner, PlannerConfig, RiskAwarePlanner
 from knowledge import AgentKnowledge, CellStatus
+from config import (
+    DEFAULT_RISK_RELAXATION, DEFAULT_SIM_CONFIG,
+    RiskRelaxationConfig,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -57,12 +65,14 @@ class Action:
     WAIT   = 'wait'
     DONE   = 'done'   # already reached or dead
 
-    def __init__(self, kind: str, cells: Optional[List[Tuple[int, int]]] = None):
-        self.kind  = kind
-        self.cells = cells or []   # sequence of cells to move through this tick
+    def __init__(self, kind: str, cells: Optional[List[Tuple[int, int]]] = None,
+                 reason: str = ''):
+        self.kind   = kind
+        self.cells  = cells or []   # sequence of cells to move through this tick
+        self.reason = reason        # human-readable explanation
 
     def __repr__(self):
-        return f"Action({self.kind}, cells={self.cells})"
+        return f"Action({self.kind}, cells={self.cells}, reason={self.reason!r})"
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +92,9 @@ class Robot:
       - hit_mine, hit_robot, timed_out  (separate death type flags)
       - steps_taken, waits_taken, replans_taken
       - unknown_cells_entered, mines_avoided_by_rerouting
+      - initial_risk_tolerance, effective_risk_tolerance, risk_relaxation_count
+      - conflicts_won, conflicts_lost, consecutive_waits, max_consecutive_waits
+      - priority_boost (for fairness)
 
     Cumulative stats (accumulated across all rounds):
       - total_wins, total_mine_deaths, total_collision_deaths, total_timeouts
@@ -89,17 +102,25 @@ class Robot:
     """
 
     def __init__(self, robot_id: int, world, planner_name: str = 'risk_aware',
-                 planner_config: Optional[PlannerConfig] = None):
+                 planner_config: Optional[PlannerConfig] = None,
+                 risk_relaxation_config: Optional[RiskRelaxationConfig] = None,
+                 rng: Optional[random.Random] = None):
         self.id     = robot_id
         self.color  = ROBOT_COLORS[robot_id % len(ROBOT_COLORS)]
         self.name   = COLOR_NAMES[robot_id % len(COLOR_NAMES)]
         self.world  = world   # GridWorld reference (for discover/scan_adjacent)
 
+        # Use isolated RNG to avoid polluting global random state
+        _rng = rng or random.Random()
+
         # Personality traits — fixed per robot across all rounds
         # These are experimental variables — see experiments.py
-        self.speed           = random.choice([1, 2])
-        self.risk_tolerance  = random.uniform(0.10, 0.90)
-        self.patience        = random.uniform(0.10, 0.90)
+        self.speed           = _rng.choice([1, 2])
+        self.risk_tolerance  = _rng.uniform(0.10, 0.90)
+        self.patience        = _rng.uniform(0.10, 0.90)
+
+        # Risk relaxation config
+        self._risk_relaxation_config = risk_relaxation_config or DEFAULT_RISK_RELAXATION
 
         # Planner — configurable for experiments
         self._planner_name   = planner_name
@@ -126,6 +147,19 @@ class Robot:
         self.replans_taken         : int = 0
         self.unknown_cells_entered : int = 0
 
+        # Risk relaxation tracking
+        self.initial_risk_tolerance   : float = self.risk_tolerance
+        self.effective_risk_tolerance : float = self.risk_tolerance
+        self.risk_relaxation_count    : int = 0
+        self.risk_relaxation_log      : List[Dict] = []  # log of relaxation events
+
+        # Conflict tracking
+        self.conflicts_won            : int = 0
+        self.conflicts_lost           : int = 0
+        self.consecutive_waits        : int = 0
+        self.max_consecutive_waits    : int = 0
+        self.priority_boost           : float = 0.0  # fairness boost
+
         # Cells temporarily avoided during replanning
         self._avoid_cells: Set[Tuple[int, int]] = set()
 
@@ -140,6 +174,7 @@ class Robot:
         self.total_timeouts         : int   = 0
         self.total_efficiency       : List[float] = []
         self.total_wait_times       : List[int]   = []
+
     # ------------------------------------------------------------------
     # Round lifecycle
     # ------------------------------------------------------------------
@@ -175,6 +210,18 @@ class Robot:
         self.replans_taken         = 0
         self.unknown_cells_entered = 0
         self._avoid_cells          = set()
+
+        # Reset risk relaxation state (restore original tolerance)
+        self.effective_risk_tolerance = self.risk_tolerance
+        self.risk_relaxation_count    = 0
+        self.risk_relaxation_log      = []
+
+        # Reset conflict tracking
+        self.conflicts_won         = 0
+        self.conflicts_lost        = 0
+        self.consecutive_waits     = 0
+        self.max_consecutive_waits = 0
+        self.priority_boost        = 0.0
 
         # Re-initialise planner (fresh instance each round)
         self.planner = make_planner(self._planner_name, self._planner_config)
@@ -235,6 +282,24 @@ class Robot:
         self.replans_taken += 1
 
     # ------------------------------------------------------------------
+    # Phase 1: Observation — separated from decision-making
+    # ------------------------------------------------------------------
+
+    def observe(self) -> None:
+        """
+        Phase 1: Scan the robot's local environment.
+
+        This method is called for ALL robots before ANY robot makes a decision.
+        It updates shared AgentKnowledge with wall observations only
+        (mines are only discovered by physically entering a cell).
+
+        This method MUST be called before decide_action().
+        """
+        if not self.alive or self.reached:
+            return
+        self.world.scan_adjacent(*self.pos)
+
+    # ------------------------------------------------------------------
     # Short-horizon deterministic trajectory prediction for other robots
     # ------------------------------------------------------------------
 
@@ -270,12 +335,12 @@ class Robot:
         return by_step
 
     # ------------------------------------------------------------------
-    # Phase 1: decide_action — pure decision, no state mutation
+    # Phase 3: decide_action — pure decision, no state mutation
     # ------------------------------------------------------------------
 
     def decide_action(self, other_robots, log_fn=None) -> Action:
         """
-        Phase 1 of the two-phase tick: determine intended action.
+        Phase 3 of the five-phase tick: determine intended action.
 
         This method MUST NOT mutate self.pos, self.alive, self.reached,
         or any game state.  It only reads state and returns an Action.
@@ -283,20 +348,23 @@ class Robot:
         The robot consults AgentKnowledge (via self.world.knowledge) only.
         No GridWorld.walls, GridWorld.mines are accessed here.
 
+        IMPORTANT: observe() must have been called for ALL robots before
+        this method is called for ANY robot. This is enforced by game.py.
+
         Returns:
             Action describing what the robot intends to do this tick.
         """
         if not self.alive or self.reached:
-            return Action(Action.DONE)
+            return Action(Action.DONE, reason='already done')
 
         knowledge = self.world.knowledge
 
-        # Scan neighbourhood BEFORE deciding (read-only: just marks knowledge)
-        self.world.scan_adjacent(*self.pos)
+        # NOTE: scan_adjacent is NO LONGER called here.
+        # It is called in observe() during Phase 1, before any decisions.
 
         # Handle waiting (robot is in a wait state from previous tick)
         if self.wait_counter > 0:
-            return Action(Action.WAIT)
+            return Action(Action.WAIT, reason=f'waiting ({self.wait_counter}t left)')
 
         # Replan if path is empty or next cell is now known-blocked
         if not self.planned_path:
@@ -305,10 +373,11 @@ class Robot:
             self.replan()
 
         if not self.planned_path:
-            return Action(Action.WAIT)  # stuck — game.py handles idle timeout
+            return Action(Action.WAIT, reason='no path found')
 
         # Compute trajectory predictions for collision awareness
-        predictions = self.predict_others(other_robots, horizon=5)
+        horizon = self._planner_config.collision_horizon if self._planner_config else 5
+        predictions = self.predict_others(other_robots, horizon=horizon)
 
         # Determine up to self.speed cells to move through this tick
         intended_cells: List[Tuple[int, int]] = []
@@ -320,32 +389,31 @@ class Robot:
 
             # Replan if next cell is now blocked
             if knowledge.is_known_blocked(*path_copy[0]):
-                # Can't replan within decide_action without mutating state;
-                # signal a WAIT and let apply_action trigger a replan next tick
                 break
 
             next_cell = path_copy[0]
             risk = self.planner.score_cell(next_cell, knowledge, predictions)
 
-            if risk > self.risk_tolerance:
+            if risk > self.effective_risk_tolerance:
                 # Too risky — will wait and replan (handled in apply_action)
                 break
 
             intended_cells.append(path_copy.pop(0))
 
         if intended_cells:
-            return Action(Action.MOVE, cells=intended_cells)
-        return Action(Action.WAIT)
+            return Action(Action.MOVE, cells=intended_cells,
+                          reason=f'planned move through {len(intended_cells)} cells')
+        return Action(Action.WAIT, reason='risk too high or path blocked')
 
     # ------------------------------------------------------------------
-    # Phase 2: apply_action — state mutation happens here
+    # Phase 5: apply_action — state mutation happens here
     # ------------------------------------------------------------------
 
     def apply_action(self, action: Action, log_fn=None) -> Optional[str]:
         """
-        Phase 2 of the two-phase tick: apply the previously decided action.
+        Phase 5 of the five-phase tick: apply the previously decided action.
 
-        Called by game.py after ALL robots have decided (simultaneous resolution).
+        Called by game.py after conflict resolution (Phase 4).
         This method mutates self.pos, waits, path, etc.
 
         Collision detection is handled by game.py (it sees all positions at once).
@@ -354,6 +422,7 @@ class Robot:
 
         Args:
             action : Action returned by decide_action() this tick
+                     (possibly modified by conflict resolution)
             log_fn : optional logging callback
 
         Returns:
@@ -379,13 +448,20 @@ class Robot:
                 # Initiate a wait + replan cycle
                 self._attempt_replan_with_wait(knowledge, log_fn)
 
+            # Track consecutive waits
+            self.consecutive_waits += 1
+            self.max_consecutive_waits = max(
+                self.max_consecutive_waits, self.consecutive_waits
+            )
+
             # Idle timeout check
             self.idle_ticks += 1
-            if self.idle_ticks >= 10:
+            max_idle = DEFAULT_SIM_CONFIG.MAX_CONSECUTIVE_IDLE_TICKS
+            if self.idle_ticks >= max_idle:
                 self.alive     = False
                 self.timed_out = True
                 if log_fn:
-                    log_fn(f"💀 {self.name} idle-timeout at {self.pos} after 10 ticks!")
+                    log_fn(f"💀 {self.name} idle-timeout at {self.pos} after {max_idle} ticks!")
             return None
 
         # ── Handle MOVE ──
@@ -403,27 +479,9 @@ class Robot:
 
                 # Re-check risk against updated knowledge
                 risk = self.planner.score_cell(next_cell, knowledge)
-                if risk > self.risk_tolerance:
-                    # Risk is now too high — avoid and replan
-                    if next_cell not in self._avoid_cells:
-                        self._avoid_cells.add(next_cell)
-                        self.replan()
-                        wait_turns = max(1, int(self.patience * 4))
-                        self.wait_counter = wait_turns
-                        self.waits_taken += 1
-                        if log_fn:
-                            log_fn(f"{self.name} avoids risky cell {next_cell}, replanning")
-                    else:
-                        # Already tried avoiding — gradually increase tolerance
-                        self.risk_tolerance = min(1.0, self.risk_tolerance + 0.1)
-                        wait_turns = max(1, int(self.patience * 2))
-                        self.wait_counter = wait_turns
-                        self.waits_taken += 1
-                        if log_fn:
-                            log_fn(
-                                f"{self.name} forced to accept risk "
-                                f"(tolerance raised to {self.risk_tolerance:.2f})"
-                            )
+                if risk > self.effective_risk_tolerance:
+                    # Risk is now too high — avoid and replan with explicit logging
+                    self._handle_risk_rejection(next_cell, risk, knowledge, log_fn)
                     break
 
                 # Check if cell is unknown (track for metrics)
@@ -436,6 +494,9 @@ class Robot:
                 self.steps_taken += 1
                 if was_unknown:
                     self.unknown_cells_entered += 1
+
+                # Reset consecutive waits on successful movement
+                self.consecutive_waits = 0
 
                 # Record for trail rendering
                 self.world.visited[self.pos].add(self.color)
@@ -465,15 +526,86 @@ class Robot:
             # Reset idle counter if we moved at all
             if self.pos != pos_at_start:
                 self.idle_ticks = 0
+                # Decay fairness priority boost on successful movement
+                self.priority_boost *= DEFAULT_SIM_CONFIG.FAIRNESS.decay_rate
             else:
                 self.idle_ticks += 1
-                if self.idle_ticks >= 10:
+                max_idle = DEFAULT_SIM_CONFIG.MAX_CONSECUTIVE_IDLE_TICKS
+                if self.idle_ticks >= max_idle:
                     self.alive     = False
                     self.timed_out = True
                     if log_fn:
                         log_fn(f"💀 {self.name} idle-timeout at {self.pos}!")
 
         return None
+
+    def _handle_risk_rejection(self, next_cell, risk, knowledge, log_fn):
+        """
+        Handle the case where the robot rejects a cell due to high risk.
+        """
+        cfg = self._risk_relaxation_config
+
+        if next_cell not in self._avoid_cells:
+            # First rejection: avoid and replan
+            self._avoid_cells.add(next_cell)
+            self.replan()
+            
+            if not self.planned_path:
+                # No alternative path exists, must relax risk
+                self._apply_risk_relaxation(next_cell, risk, log_fn)
+                self._avoid_cells.discard(next_cell)
+                self.replan()
+            else:
+                wait_turns = max(1, int(self.patience * 4))
+                self.wait_counter = wait_turns
+                self.waits_taken += 1
+                if log_fn:
+                    log_fn(f"{self.name} avoids risky cell {next_cell} "
+                           f"(risk={risk:.3f} > tol={self.effective_risk_tolerance:.3f}), replanning")
+        else:
+            # Already tried avoiding — apply risk relaxation
+            self._apply_risk_relaxation(next_cell, risk, log_fn)
+
+    def _apply_risk_relaxation(self, next_cell, risk, log_fn):
+        cfg = self._risk_relaxation_config
+        if self.risk_relaxation_count < cfg.max_relaxations:
+            old_tol = self.effective_risk_tolerance
+            self.effective_risk_tolerance = min(
+                cfg.max_tolerance,
+                self.effective_risk_tolerance + cfg.relax_step
+            )
+            self.risk_relaxation_count += 1
+
+            # Record relaxation event
+            event = {
+                'initial_tolerance': self.risk_tolerance,
+                'previous_tolerance': old_tol,
+                'new_tolerance': self.effective_risk_tolerance,
+                'relaxation_number': self.risk_relaxation_count,
+                'reason': f'cell {next_cell} risk={risk:.3f}, no alternative path',
+                'cell': next_cell,
+            }
+            self.risk_relaxation_log.append(event)
+
+            wait_turns = max(1, int(self.patience * 2))
+            self.wait_counter = wait_turns
+            self.waits_taken += 1
+            if log_fn:
+                log_fn(
+                    f"{self.name} risk relaxation #{self.risk_relaxation_count}: "
+                    f"tolerance {old_tol:.3f} → {self.effective_risk_tolerance:.3f} "
+                    f"(initial={self.risk_tolerance:.3f})"
+                )
+        else:
+            # Max relaxations reached — force accept
+            wait_turns = max(1, int(self.patience * 2))
+            self.wait_counter = wait_turns
+            self.waits_taken += 1
+            if log_fn:
+                log_fn(
+                    f"{self.name} max relaxations reached ({cfg.max_relaxations}), "
+                    f"forced to wait at {self.pos}"
+                )
 
     def _attempt_replan_with_wait(self, knowledge, log_fn) -> None:
         """Helper: try to replan and set a wait if replanning fails."""
@@ -490,26 +622,51 @@ class Robot:
             # Found a new path — check if it's risky
             next_cell = self.planned_path[0]
             risk = self.planner.score_cell(next_cell, knowledge)
-            if risk > self.risk_tolerance:
-                if next_cell not in self._avoid_cells:
-                    self._avoid_cells.add(next_cell)
-                    self.replan()
-                wait_turns = max(1, int(self.patience * 4))
-                self.wait_counter = wait_turns
-                self.waits_taken += 1
-                if log_fn:
-                    log_fn(f"{self.name} replanned but risky — waiting {wait_turns}t")
+            if risk > self.effective_risk_tolerance:
+                self._handle_risk_rejection(next_cell, risk, knowledge, log_fn)
+
+    # ------------------------------------------------------------------
+    # Conflict tracking (called by game.py conflict resolution)
+    # ------------------------------------------------------------------
+
+    def record_conflict_win(self):
+        """Record that this robot won a conflict resolution."""
+        self.conflicts_won += 1
+
+    def record_conflict_loss(self):
+        """Record that this robot lost a conflict resolution."""
+        self.conflicts_lost += 1
+        self.consecutive_waits += 1
+        self.max_consecutive_waits = max(
+            self.max_consecutive_waits, self.consecutive_waits
+        )
+        # Check if starvation prevention should kick in
+        fairness = DEFAULT_SIM_CONFIG.FAIRNESS
+        if self.consecutive_waits >= fairness.max_consecutive_losses:
+            self.priority_boost += fairness.priority_boost
+
+    def get_priority_score(self) -> float:
+        """
+        Compute priority score for conflict resolution.
+
+        Higher score = higher priority (gets to move).
+        Components:
+            - Base: consecutive wait time
+            - Boost: accumulated fairness boost from repeated losses
+        """
+        return float(self.consecutive_waits) + self.priority_boost
 
     # ------------------------------------------------------------------
     # Legacy decide() — kept for backward compatibility if needed
-    # (Not used in the two-phase tick; use decide_action + apply_action)
+    # (Not used in the five-phase tick; use observe + decide_action + apply_action)
     # ------------------------------------------------------------------
 
     def decide(self, other_robots, log_fn=None) -> None:
         """
         Legacy single-phase decision method.
-        Preserved for backward compatibility but NOT used in the two-phase tick.
-        Use decide_action() + apply_action() in game.py instead.
+        Preserved for backward compatibility but NOT used in the five-phase tick.
+        Use observe() + decide_action() + apply_action() in game.py instead.
         """
+        self.observe()
         action = self.decide_action(other_robots, log_fn)
         self.apply_action(action, log_fn)

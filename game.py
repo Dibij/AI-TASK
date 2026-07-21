@@ -33,6 +33,7 @@ Metrics tracked:
 
 import random
 import json
+import csv
 import os
 import datetime
 import collections
@@ -62,17 +63,19 @@ class Game:
 
     def __init__(self, seed: Optional[int] = None,
                  planner_name: str = 'risk_aware',
+                 planner_config = None,
                  num_robots: int = NUM_ROBOTS,
                  max_rounds: int = MAX_ROUNDS):
         self.seed          = seed
         self.planner_name  = planner_name
+        self.planner_config = planner_config
         self.num_robots    = num_robots
         self.max_rounds    = max_rounds
 
         # Create robots (world reference will be updated each round)
         self.world   = GridWorld(seed=seed)
         self.robots  = [
-            Robot(i, self.world, planner_name=planner_name)
+            Robot(i, self.world, planner_name=planner_name, planner_config=planner_config)
             for i in range(num_robots)
         ]
 
@@ -269,20 +272,13 @@ class Game:
 
     def tick_simulation(self) -> None:
         """
-        Advance simulation by one tick using the two-phase protocol.
-
-        Phase 1 — Decision:
-            All living robots call decide_action() with the SAME current state.
-            No robot state is mutated during Phase 1.
-            This eliminates update-order bias (Robot 0 no longer has priority).
-
-        Phase 2 — Resolution:
-            Collect all intended Actions.
-            Detect and resolve collisions:
-              - Same-cell collisions: two robots land on the same cell.
-              - Swap collisions: two robots swap positions in one tick.
-            Apply each robot's action via apply_action().
-            Apply collision deaths AFTER movement.
+        Advance simulation by one tick using the five-phase protocol.
+        
+        Phase 1: Observation — All robots scan adjacents.
+        Phase 2: Knowledge Update — Constraint propagation runs.
+        Phase 3: Decision — All robots decide action (no state mutation).
+        Phase 4: Conflict Resolution — Intended actions are resolved by priority.
+        Phase 5: Action Application — Approved actions are applied.
         """
         self.tick_logs = []
         if not self.running:
@@ -292,81 +288,135 @@ class Game:
 
         active = [r for r in self.robots if r.alive and not r.reached]
 
-        # ── Phase 1: Decision (no state mutation) ──
+        # ── Phase 1: Observation ──
+        for robot in active:
+            robot.observe()
+
+        # ── Phase 2: Knowledge Update ──
+        self.world.knowledge.propagate_constraints()
+
+        # ── Phase 3: Decision (no state mutation) ──
         actions = {}
         for robot in active:
             actions[robot.id] = robot.decide_action(self.robots, log_fn=self._log)
 
-        # ── Phase 2: Resolution ──
-        # Apply each robot's action (movement + mine discovery + arrival)
+        # ── Phase 4: Conflict Resolution ──
+        self._resolve_swap_conflicts(active, actions)
+        self._resolve_same_cell_conflicts(active, actions)
+
+        # ── Phase 5: Action Application ──
         for robot in active:
             action = actions.get(robot.id, Action(Action.WAIT))
             robot.apply_action(action, log_fn=self._log)
 
-        # ── Collision Detection (after all moves) ──
-        self._resolve_collisions()
-
-        # ── Swap Collision Detection ──
-        self._resolve_swap_collisions(active, actions)
-
         # ── Round-end check ──
         self._check_round_over()
 
-    def _resolve_collisions(self) -> None:
+    def _resolve_swap_conflicts(self, active_before, actions) -> None:
         """
-        Detect same-cell collisions: multiple living robots at the same position.
-        These are marked as hit_robot=True (not hit_mine).
+        Detect swap conflicts and convert the loser's action to WAIT.
         """
-        pos_map = collections.defaultdict(list)
-        for robot in self.robots:
-            if robot.alive and not robot.reached:
-                pos_map[robot.pos].append(robot)
-
-        for pos, bots in pos_map.items():
-            if len(bots) > 1:
-                names = [b.name for b in bots]
-                self._log(
-                    f"💥 COLLISION at {pos}! "
-                    f"{', '.join(names)} collided!"
-                )
-                for b in bots:
-                    b.alive     = False
-                    b.hit_robot = True  # correctly typed as collision, not mine
-
-    def _resolve_swap_collisions(self, active_before, actions) -> None:
-        """
-        Detect swap collisions: robots A and B exchanging positions in one tick.
-        (A moves A_pos→B_pos and B moves B_pos→A_pos simultaneously.)
-        """
-        # Map robot_id -> (old_pos, new_pos)
+        from config import DEFAULT_SIM_CONFIG, ConflictPolicy
         moves = {}
         for robot in active_before:
             action = actions.get(robot.id)
             if action and action.kind == Action.MOVE and action.cells:
                 moves[robot.id] = (robot.pos, action.cells[-1])
-            # Note: robot.pos may have been updated by apply_action already
-            # Use the first cell in action to detect the initial swap
 
-        # Check each pair for swap
         ids = list(moves.keys())
         for i in range(len(ids)):
             for j in range(i + 1, len(ids)):
                 id_a, id_b = ids[i], ids[j]
-                old_a, new_a = moves[id_a]
-                old_b, new_b = moves[id_b]
-                # Swap: A went to B's old pos AND B went to A's old pos
-                if new_a == old_b and new_b == old_a:
+                old_a, new_a = moves.get(id_a, (None, None))
+                old_b, new_b = moves.get(id_b, (None, None))
+                if new_a and new_b and new_a == old_b and new_b == old_a:
                     robot_a = next(r for r in self.robots if r.id == id_a)
                     robot_b = next(r for r in self.robots if r.id == id_b)
-                    if robot_a.alive and robot_b.alive:
+                    
+                    score_a = robot_a.get_priority_score()
+                    score_b = robot_b.get_priority_score()
+                    
+                    policy = DEFAULT_SIM_CONFIG.CONFLICT_POLICY
+                    if policy == ConflictPolicy.BY_ROBOT_ID:
+                        winner, loser = (robot_a, robot_b) if id_a < id_b else (robot_b, robot_a)
+                    elif policy == ConflictPolicy.ROTATING:
+                        if (self.tick + id_a) % self.num_robots < (self.tick + id_b) % self.num_robots:
+                            winner, loser = robot_b, robot_a
+                        else:
+                            winner, loser = robot_a, robot_b
+                    else: # Score based
+                        if score_a >= score_b:
+                            winner, loser = robot_a, robot_b
+                        else:
+                            winner, loser = robot_b, robot_a
+                    
+                    winner.record_conflict_win()
+                    loser.record_conflict_loss()
+                    
+                    self._log(
+                        f"🛡️ SWAP CONFLICT {robot_a.name} ↔ {robot_b.name}. "
+                        f"{winner.name} wins priority. {loser.name} waits."
+                    )
+                    
+                    actions[loser.id] = Action(Action.WAIT, reason="lost swap conflict")
+                    moves.pop(loser.id, None)
+
+    def _resolve_same_cell_conflicts(self, active_before, actions) -> None:
+        """
+        Detect same-cell conflicts and convert losers' actions to WAIT.
+        Iterates until no conflicts remain.
+        """
+        from config import DEFAULT_SIM_CONFIG, ConflictPolicy
+        
+        while True:
+            destinations = collections.defaultdict(list)
+            for robot in active_before:
+                action = actions.get(robot.id)
+                if action and action.kind == Action.MOVE and action.cells:
+                    destinations[action.cells[-1]].append(robot)
+                else:
+                    destinations[robot.pos].append(robot)
+
+            conflict_found = False
+            for pos, bots in destinations.items():
+                if len(bots) > 1:
+                    conflict_found = True
+                    policy = DEFAULT_SIM_CONFIG.CONFLICT_POLICY
+                    
+                    def sort_key(b):
+                        action = actions.get(b.id)
+                        is_waiting = action is None or action.kind != Action.MOVE
+                        score = b.get_priority_score()
+                        if policy == ConflictPolicy.BY_ROBOT_ID:
+                            base = -b.id
+                        elif policy == ConflictPolicy.ROTATING:
+                            base = -((self.tick + b.id) % self.num_robots)
+                        else:
+                            base = score
+                        return (1 if is_waiting else 0, base)
+                    
+                    bots.sort(key=sort_key, reverse=True)
+                    
+                    winner = bots[0]
+                    losers = bots[1:]
+                    
+                    winner.record_conflict_win()
+                    loser_names = []
+                    for loser in losers:
+                        loser.record_conflict_loss()
+                        action = actions.get(loser.id)
+                        if action and action.kind == Action.MOVE:
+                            actions[loser.id] = Action(Action.WAIT, reason="lost cell conflict")
+                            loser_names.append(loser.name)
+                    
+                    if loser_names:
                         self._log(
-                            f"💥 SWAP COLLISION! {robot_a.name} ↔ {robot_b.name} "
-                            f"crossed paths between {old_a} and {old_b}!"
+                            f"🛡️ CELL CONFLICT at {pos}. "
+                            f"{winner.name} wins. {', '.join(loser_names)} wait."
                         )
-                        robot_a.alive     = False
-                        robot_a.hit_robot = True
-                        robot_b.alive     = False
-                        robot_b.hit_robot = True
+            
+            if not conflict_found:
+                break
 
     def _check_round_over(self) -> None:
         """Check if all robots are done this tick."""
@@ -405,24 +455,20 @@ class Game:
     # ------------------------------------------------------------------
 
     def _export_data(self) -> None:
-        """Write full simulation results to logs/ as JSON."""
-        data = {
-            "meta": {
-                "seed"        : self.seed,
-                "planner"     : self.planner_name,
-                "rounds"      : self.max_rounds,
-                "num_robots"  : self.num_robots,
-                "max_ticks"   : MAX_TICKS,
-                "timestamp"   : datetime.datetime.now().isoformat(),
-            },
-            "robots": [],
-            "round_history": self.round_summary,
-            "full_log": self.log,
+        """Write full simulation results to logs/ as CSV."""
+        meta = {
+            "meta_seed"        : self.seed,
+            "meta_planner"     : self.planner_name,
+            "meta_rounds"      : self.max_rounds,
+            "meta_num_robots"  : self.num_robots,
+            "meta_max_ticks"   : MAX_TICKS,
+            "meta_timestamp"   : datetime.datetime.now().isoformat(),
         }
 
+        rows = []
         for r in self.robots:
             total_rounds = len(r.total_efficiency)
-            data["robots"].append({
+            row = {
                 "id"                    : r.id,
                 "name"                  : r.name,
                 "speed"                 : r.speed,
@@ -443,14 +489,23 @@ class Game:
                 "avg_efficiency"        : self.avg_efficiency(r),
                 # Decision behaviour
                 "avg_wait_per_round"    : self.avg_wait(r),
-                "total_wait_rounds"     : r.total_wait_times,
-            })
+                "total_wait_rounds"     : str(r.total_wait_times),
+            }
+            row.update(meta)
+            rows.append(row)
 
         os.makedirs("logs", exist_ok=True)
-        ts       = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = os.path.join("logs", f"tournament_{self.planner_name}_{ts}.json")
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4)
+        filename = os.path.join("logs", "tournaments_master.csv")
+        
+        if rows:
+            keys = rows[0].keys()
+            mode = 'a' if os.path.exists(filename) else 'w'
+            with open(filename, mode, newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=keys)
+                if mode == 'w':
+                    writer.writeheader()
+                writer.writerows(rows)
+            
         self._log(f"Data exported → {filename}")
 
     # ------------------------------------------------------------------

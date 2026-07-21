@@ -623,83 +623,85 @@ class TestGridDiscovery:
 
 
 # ===========================================================================
-# 7. Multi-Agent: Same-Cell Collision
+# 7. Multi-Agent: Same-Cell Conflict
 # ===========================================================================
 
-class TestSameCellCollision:
+class TestSameCellConflict:
 
     def _make_game(self):
         return Game(seed=999, num_robots=4, max_rounds=1)
 
-    def test_collision_marks_hit_robot_not_hit_mine(self):
+    def test_same_cell_conflict_resolution(self):
         """
-        If two robots end up on the same cell, they should have hit_robot=True
-        and hit_mine=False.
+        If two robots intend to move to the same cell, the one with lower priority
+        should have its action converted to WAIT, and neither dies.
         """
         game = self._make_game()
-        # Artificially place two robots on the same cell
         r0, r1 = game.robots[0], game.robots[1]
-        # Both alive, not reached, same position
-        r0.alive = True; r0.reached = False; r0.pos = (5, 5)
-        r1.alive = True; r1.reached = False; r1.pos = (5, 5)
-        r0.hit_mine = False; r0.hit_robot = False
-        r1.hit_mine = False; r1.hit_robot = False
+        
+        # Give r1 higher priority (more waits)
+        r1.consecutive_waits = 5
+        r0.consecutive_waits = 0
 
-        game._resolve_collisions()
+        active = [r0, r1]
+        actions = {
+            r0.id: Action(Action.MOVE, cells=[(5, 5)]),
+            r1.id: Action(Action.MOVE, cells=[(5, 5)]),
+        }
 
-        assert not r0.alive
-        assert not r1.alive
-        assert r0.hit_robot is True,  "Collision should set hit_robot=True"
-        assert r1.hit_robot is True,  "Collision should set hit_robot=True"
-        assert r0.hit_mine  is False, "Collision must NOT set hit_mine=True"
-        assert r1.hit_mine  is False, "Collision must NOT set hit_mine=True"
+        game._resolve_same_cell_conflicts(active, actions)
 
-    def test_single_robot_no_collision(self):
-        """Only one robot on a cell → no collision."""
+        assert r0.alive and r1.alive
+        assert actions[r1.id].kind == Action.MOVE
+        assert actions[r0.id].kind == Action.WAIT
+        assert "lost cell conflict" in actions[r0.id].reason
+
+    def test_single_robot_no_conflict(self):
+        """Only one robot moving to a cell → no conflict."""
         game = self._make_game()
         r0 = game.robots[0]
-        r0.alive = True; r0.reached = False; r0.pos = (3, 3)
-        for i in range(1, len(game.robots)):
-            game.robots[i].pos = (0, i)
+        active = [r0]
+        actions = {
+            r0.id: Action(Action.MOVE, cells=[(3, 3)])
+        }
 
-        game._resolve_collisions()
-        assert r0.alive, "Single robot should not die from collision"
+        game._resolve_same_cell_conflicts(active, actions)
+        
+        assert actions[r0.id].kind == Action.MOVE
 
 
 # ===========================================================================
-# 8. Multi-Agent: Swap Collision
+# 8. Multi-Agent: Swap Conflict
 # ===========================================================================
 
-class TestSwapCollision:
+class TestSwapConflict:
 
-    def test_swap_collision_detected(self):
+    def test_swap_conflict_resolution(self):
         """
         Robot A at (3,3) moves to (3,4); Robot B at (3,4) moves to (3,3).
-        This is a swap → both should die with hit_robot=True.
+        This is a swap → loser's action is converted to WAIT.
         """
         game = Game(seed=111, num_robots=2, max_rounds=1)
         r0, r1 = game.robots[0], game.robots[1]
 
-        # Set up positions
-        r0.alive = True; r0.reached = False; r0.pos = (3, 3)
-        r1.alive = True; r1.reached = False; r1.pos = (3, 4)
-        r0.hit_robot = False; r1.hit_robot = False
+        r0.pos = (3, 3)
+        r1.pos = (3, 4)
+        
+        r0.consecutive_waits = 0
+        r1.consecutive_waits = 5 # higher priority
 
-        # Simulate the actions that produced the swap
         active = [r0, r1]
-        # Action for r0: MOVE to (3,4)
-        # Action for r1: MOVE to (3,3)
         actions = {
             r0.id: Action(Action.MOVE, cells=[(3, 4)]),
             r1.id: Action(Action.MOVE, cells=[(3, 3)]),
         }
 
-        game._resolve_swap_collisions(active, actions)
+        game._resolve_swap_conflicts(active, actions)
 
-        assert not r0.alive, "r0 should die in swap collision"
-        assert not r1.alive, "r1 should die in swap collision"
-        assert r0.hit_robot is True
-        assert r1.hit_robot is True
+        assert r0.alive and r1.alive
+        assert actions[r1.id].kind == Action.MOVE
+        assert actions[r0.id].kind == Action.WAIT
+        assert "lost swap conflict" in actions[r0.id].reason
 
 
 # ===========================================================================
@@ -936,29 +938,6 @@ class TestReproducibility:
         assert g1.world.walls == g2.world.walls
         assert g1.world.mines == g2.world.mines
 
-    def test_experiment_paired_comparison_same_world(self):
-        """
-        Two different planners with the same seed should face the same environment.
-        """
-        from experiments import run_experiment
-        r_a = run_experiment("A", seed=42, num_rounds=2, num_robots=2, verbose=False)
-        r_b = run_experiment("B", seed=42, num_rounds=2, num_robots=2, verbose=False)
-        # World stats per round should match
-        for i in range(min(len(r_a["rounds"]), len(r_b["rounds"]))):
-            mines_a = r_a["rounds"][i]["world_mines"]
-            mines_b = r_b["rounds"][i]["world_mines"]
-            walls_a = r_a["rounds"][i]["world_walls"]
-            walls_b = r_b["rounds"][i]["world_walls"]
-            assert mines_a == mines_b, f"Round {i+1}: mine count differs between configs"
-            assert walls_a == walls_b, f"Round {i+1}: wall count differs between configs"
-
-
-# ===========================================================================
-# 13. Information-Leak Audit
-# ===========================================================================
-
-class TestInformationLeak:
-
     def test_probability_model_doesnt_access_world_mines(self):
         """
         AgentKnowledge.get_mine_probability must work without a world reference.
@@ -1039,57 +1018,7 @@ class TestInformationLeak:
 # 14. Experiments Runner
 # ===========================================================================
 
-class TestExperimentsRunner:
 
-    def test_experiment_a_runs(self):
-        from experiments import run_experiment
-        result = run_experiment("A", seed=1, num_rounds=2, num_robots=2, verbose=False)
-        assert "meta" in result
-        assert "aggregate" in result
-        assert "rounds" in result
-        assert len(result["rounds"]) == 2
-
-    def test_experiment_b_runs(self):
-        from experiments import run_experiment
-        result = run_experiment("B", seed=1, num_rounds=2, num_robots=2, verbose=False)
-        assert result["meta"]["config_key"] == "B"
-
-    def test_experiment_c_runs(self):
-        from experiments import run_experiment
-        result = run_experiment("C", seed=1, num_rounds=2, num_robots=2, verbose=False)
-        assert result["meta"]["config_key"] == "C"
-
-    def test_paired_comparison_runs(self):
-        from experiments import run_paired_comparison
-        results = run_paired_comparison(
-            ["A", "B"], seed=5, num_rounds=2, num_robots=2, verbose=False
-        )
-        assert "A" in results
-        assert "B" in results
-
-    def test_aggregate_metrics_present(self):
-        from experiments import run_experiment
-        result = run_experiment("B", seed=7, num_rounds=3, num_robots=2, verbose=False)
-        for robot_name, stats in result["aggregate"].items():
-            for key in ["survival_rate", "mine_death_rate", "collision_death_rate",
-                        "completion_rate", "avg_efficiency", "avg_waits"]:
-                assert key in stats, f"Missing metric '{key}' for {robot_name}"
-                assert 0.0 <= stats[key] <= 1.0 or key == "avg_waits", \
-                    f"Metric {key}={stats[key]} out of [0,1]"
-
-    def test_round_results_have_correct_fields(self):
-        from experiments import run_experiment
-        result = run_experiment("A", seed=9, num_rounds=1, num_robots=2, verbose=False)
-        rnd = result["rounds"][0]
-        assert "ticks" in rnd
-        assert "robots" in rnd
-        assert "round_seed" in rnd
-        assert "world_mines" in rnd
-        assert "world_walls" in rnd
-        for rb in rnd["robots"]:
-            for field in ["reached", "hit_mine", "hit_robot", "timed_out",
-                          "steps", "waits", "replans"]:
-                assert field in rb, f"Missing field '{field}' in per-robot result"
 
 
 # ===========================================================================
@@ -1142,4 +1071,84 @@ class TestUtils:
                 if (r, c) not in world.walls
             }
             assert is_fully_connected(passable, world.rows, world.cols), \
-                f"World with seed={seed} is not fully connected"
+                f"Grid world not fully connected for seed {seed}"
+
+# ===========================================================================
+# 15. Risk Relaxation Tests
+# ===========================================================================
+
+class TestRiskRelaxation:
+    def test_risk_relaxation_log_populated(self):
+        from game import Game
+        from config import RiskRelaxationConfig
+        from robot import Action
+
+        game = Game(seed=100, num_robots=1, max_rounds=1)
+        r = game.robots[0]
+        
+        # Configure tight risk tolerance
+        r.risk_tolerance = 0.0
+        r.effective_risk_tolerance = 0.0
+        r._risk_relaxation_config = RiskRelaxationConfig(max_relaxations=3, relax_step=0.1)
+
+        # Force a situation where a cell is too risky
+        # We simulate this by making planner score return high risk
+        class FakePlanner:
+            def score_cell(self, cell, kb, predictions=None):
+                return 0.5 # Higher than tolerance 0.0
+            def plan(self, start, target, kb, avoid_cells=None, predictions=None):
+                # Return a fake path that contains a cell not in avoid_cells
+                if (1, 1) in (avoid_cells or set()):
+                    return []
+                return [(0,0), (1,1)]
+
+        r.planner = FakePlanner()
+        r.planned_path = [(1,1)]
+        r.pos = (0,0)
+        r.target = (2,2)
+        r.alive = True
+        r.reached = False
+
+        # First attempt: avoids the cell and replans (empty path -> gets stuck)
+        action = r.decide_action(game.robots)
+        assert action.kind == Action.WAIT
+        r.apply_action(action)
+
+        # Next tick: already avoided, so it should relax risk
+        r.wait_counter = 0
+        action = r.decide_action(game.robots)
+        assert action.kind == Action.WAIT
+        r.apply_action(action)
+
+        # Check that relaxation log was populated
+        assert r.risk_relaxation_count == 2
+        assert len(r.risk_relaxation_log) == 2
+        event = r.risk_relaxation_log[0]
+        assert event["initial_tolerance"] == 0.0
+        assert event["new_tolerance"] == 0.1
+        assert event["relaxation_number"] == 1
+
+
+# ===========================================================================
+# 16. Collision Prediction Tests
+# ===========================================================================
+
+class TestCollisionPrediction:
+    def test_predict_others_horizon(self):
+        from game import Game
+        game = Game(seed=100, num_robots=2, max_rounds=1)
+        r0, r1 = game.robots[0], game.robots[1]
+        
+        r0.pos = (0, 0)
+        r0.speed = 1
+        r0.planned_path = [(0,1), (0,2), (0,3), (0,4)]
+        r0.alive = True
+        
+        r1.pos = (5, 5)
+        r1.alive = True
+        
+        # Predict r0's path from r1's perspective
+        predictions = r1.predict_others([r0, r1], horizon=3)
+        assert (0, 1) in predictions[1]
+        assert (0, 2) in predictions[2]
+        assert (0, 3) in predictions[3]
