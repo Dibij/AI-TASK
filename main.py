@@ -82,7 +82,7 @@ CLUE_COLORS     = {
 }
 
 # Default ticks per second
-DEFAULT_TPS     = 4
+DEFAULT_TPS     = 1
 MIN_TPS         = 1
 MAX_TPS         = 20
 
@@ -125,6 +125,7 @@ class Renderer:
         self.f_console  = pygame.font.SysFont("Consolas", 11)
         self.f_big      = pygame.font.SysFont("Segoe UI", 26, bold=True)
         self.log_scroll = 0
+        self.selected_robot = None
 
         # Load robot sprites
         self.sprites = {}
@@ -237,6 +238,8 @@ class Renderer:
 
         # ── Target markers ──
         for robot in robots:
+            if self.selected_robot is not None and robot.id != self.selected_robot:
+                continue
             if robot.target:
                 tr, tc  = robot.target
                 t_rect  = cell_rect(tr, tc)
@@ -251,6 +254,8 @@ class Renderer:
 
         # ── Planned paths (dotted lines) ──
         for robot in robots:
+            if self.selected_robot is not None and robot.id != self.selected_robot:
+                continue
             if not robot.alive:
                 continue
             path = [robot.pos] + robot.planned_path
@@ -273,6 +278,8 @@ class Renderer:
         # NOTE: These are SHORT-HORIZON DETERMINISTIC TRAJECTORY PREDICTIONS,
         # not probabilistic collision probabilities.
         for robot in robots:
+            if self.selected_robot is not None and robot.id != self.selected_robot:
+                continue
             if not robot.alive:
                 continue
             preds = robot.predict_others(robots, horizon=3)
@@ -649,7 +656,22 @@ def main():
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
-                    if (hasattr(renderer, "play_pause_rect")
+                    # Check if click on robot to isolate view
+                    mx, my = event.pos
+                    clicked_robot_id = None
+                    for robot in game.robots:
+                        if robot.pos:
+                            cx, cy = cell_center(*robot.pos)
+                            if math.hypot(mx - cx, my - cy) <= (CELL_PX // 2):
+                                clicked_robot_id = robot.id
+                                break
+                    
+                    if clicked_robot_id is not None:
+                        if renderer.selected_robot == clicked_robot_id:
+                            renderer.selected_robot = None
+                        else:
+                            renderer.selected_robot = clicked_robot_id
+                    elif (hasattr(renderer, "play_pause_rect")
                             and renderer.play_pause_rect.collidepoint(event.pos)):
                         paused = not paused
                 elif event.button == 4:

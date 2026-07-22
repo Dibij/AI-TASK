@@ -1,15 +1,4 @@
-"""
-experiments.py — Headless experiment runner for the multi-agent grid world.
-
-Supports reproducible, paired-comparison experiments across different
-planner configurations and personality sweeps.
-
-Features:
-- Event-based JSONL logging
-- Crash recovery (resume from existing directory)
-- Statistical summaries (mean, stdev, 95% CI, paired t-tests)
-- Configurable output directory
-"""
+from __future__ import annotations
 
 import argparse
 import json
@@ -17,8 +6,9 @@ import os
 import datetime
 import math
 import collections
-from typing import Dict, List, Optional, Tuple
-import convert_logs
+import subprocess
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any
 
 try:
     import scipy.stats
@@ -28,6 +18,7 @@ except ImportError:
 
 from planner import CONFIGS, PlannerConfig
 from game import Game, MAX_TICKS
+from config import DEFAULT_SIM_CONFIG
 
 
 def init_gui():
@@ -55,7 +46,6 @@ def pump_gui(pygame, screen, renderer, bg, game):
     renderer.draw_grid(game)
     renderer.draw_sidebar(game, tps=1000) # Uncapped
     pygame.display.flip()
-
 
 # ---------------------------------------------------------------------------
 # Experiment configuration registry
@@ -132,12 +122,12 @@ PERSONALITY_SWEEPS: Dict[str, Dict] = {
     },
 }
 
-
 # ---------------------------------------------------------------------------
 # Statistics Helpers
 # ---------------------------------------------------------------------------
 
 def calculate_stats(data: List[float]) -> Dict[str, float]:
+    """Calculate basic statistics for a list of floats."""
     if not data:
         return {"mean": 0.0, "median": 0.0, "stdev": 0.0, "ci95": 0.0}
     n = len(data)
@@ -155,11 +145,119 @@ def calculate_stats(data: List[float]) -> Dict[str, float]:
 
 
 def paired_t_test(baseline: List[float], treatment: List[float]) -> Tuple[float, float]:
-    """Returns (t_stat, p_value)"""
+    """Calculate paired t-test returning (t_stat, p_value)."""
     if not HAS_SCIPY or len(baseline) < 2 or len(treatment) < 2 or len(baseline) != len(treatment):
         return (0.0, 1.0)
     res = scipy.stats.ttest_rel(baseline, treatment)
     return (float(res.statistic), float(res.pvalue))
+
+
+def build_summary_dict(runs_data: List[Dict[str, Any]], config_keys: List[str], num_robots: int) -> Dict[str, Any]:
+    """Build summary stats and comparisons for experiment runs."""
+    results_by_config = collections.defaultdict(list)
+    for evt in runs_data:
+        results_by_config[evt["config"]].append(evt)
+        
+    stats = {}
+    for key in config_keys:
+        evts = results_by_config[key]
+        if not evts:
+            continue
+            
+        round_efficiencies = []
+        round_mine_deaths = []
+        round_coll_deaths = []
+        round_successes = []
+        
+        for evt in evts:
+            effs = []
+            mines = 0
+            colls = 0
+            succs = 0
+            for r_stat in evt["robots"]:
+                if r_stat["reached"]:
+                    succs += 1
+                    effs.append(r_stat["efficiency"] or 0.0)
+                else:
+                    effs.append(0.0)
+                    if r_stat["hit_mine"]: mines += 1
+                    if r_stat["hit_robot"]: colls += 1
+            round_efficiencies.append(sum(effs) / num_robots)
+            round_mine_deaths.append(mines / num_robots)
+            round_coll_deaths.append(colls / num_robots)
+            round_successes.append(succs / num_robots)
+            
+        stats[key] = {
+            "efficiency": calculate_stats(round_efficiencies),
+            "mine_deaths": calculate_stats(round_mine_deaths),
+            "coll_deaths": calculate_stats(round_coll_deaths),
+            "success": calculate_stats(round_successes),
+            "raw": {
+                "efficiency": round_efficiencies,
+                "mine_deaths": round_mine_deaths,
+                "coll_deaths": round_coll_deaths,
+                "success": round_successes
+            }
+        }
+        
+    baseline_key = config_keys[0] if config_keys else None
+    comparisons = {}
+    if HAS_SCIPY and baseline_key and baseline_key in stats:
+        for key in config_keys[1:]:
+            if key not in stats: continue
+            comparisons[key] = {
+                "efficiency": paired_t_test(stats[baseline_key]["raw"]["efficiency"], stats[key]["raw"]["efficiency"]),
+                "success": paired_t_test(stats[baseline_key]["raw"]["success"], stats[key]["raw"]["success"])
+            }
+            
+    summary_doc = {
+        "stats": {k: {mk: mv for mk, mv in v.items() if mk != "raw"} for k, v in stats.items()},
+        "comparisons": comparisons
+    }
+    return summary_doc
+
+
+def print_summary(exp_dir: str, config_keys: List[str], summary_doc: Dict[str, Any]):
+    """Print the final summary to standard output."""
+    stats = summary_doc.get("stats", {})
+    comparisons = summary_doc.get("comparisons", {})
+    
+    print(f"\n{'='*80}")
+    print(f"FINAL SUMMARY ({exp_dir})")
+    print(f"{'Config':<8} | {'Success Rate (95% CI)':<25} | {'Efficiency (95% CI)':<25} | {'Mine D.':<10}")
+    print("-" * 80)
+    for key in config_keys:
+        if key not in stats: continue
+        s = stats[key]
+        succ = s['success']
+        eff = s['efficiency']
+        mines = s['mine_deaths']
+        
+        succ_str = f"{succ['mean']:.1%} ± {succ['ci95']:.1%}"
+        eff_str = f"{eff['mean']:.3f} ± {eff['ci95']:.3f}"
+        
+        star = ""
+        if key in comparisons:
+            p_succ = comparisons[key]["success"][1]
+            if p_succ < 0.05: star = "*"
+            
+        print(f"{key:<8} | {succ_str+star:<25} | {eff_str:<25} | {mines['mean']:.1%}")
+        
+    baseline_key = config_keys[0] if config_keys else None
+    if HAS_SCIPY:
+        print(f"\n* denotes p < 0.05 vs Baseline ({baseline_key}) in paired t-test.")
+    else:
+        print(f"\n(scipy not installed; t-tests skipped)")
+    print("="*80)
+
+
+def generate_reports(exp_dir: str):
+    """Call the analysis/main.py script to generate plots and reports."""
+    import sys
+    try:
+        subprocess.run([sys.executable, "-m", "analysis.main", "--experiment-dir", exp_dir], check=True)
+    except Exception as e:
+        print(f"Failed to generate reports: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -169,42 +267,62 @@ def paired_t_test(baseline: List[float], treatment: List[float]) -> Tuple[float,
 def run_paired_comparison(config_keys: List[str], seed: int, num_seeds: int,
                           num_robots: int = 4, output_dir: str = "logs",
                           resume_dir: Optional[str] = None, verbose: bool = True,
-                          use_gui: bool = False):
-    """
-    Run multiple experiment configurations on the SAME set of seeds (paired).
-    """
-    # 1. Setup output directory
+                          use_gui: bool = False, debug_runs: bool = False):
+    """Run multiple experiment configurations on the SAME set of seeds."""
+    out_path = Path(output_dir)
     if resume_dir:
-        exp_dir = resume_dir
-        if not os.path.exists(exp_dir):
+        exp_dir = Path(resume_dir)
+        if not exp_dir.exists():
             raise ValueError(f"Resume directory {exp_dir} does not exist.")
     else:
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         keys_str = "_".join(config_keys)
-        exp_dir = os.path.join(output_dir, f"experiment_{keys_str}_seed{seed}_{ts}")
-        os.makedirs(exp_dir, exist_ok=True)
+        exp_dir = out_path / f"experiment_{keys_str}_seed{seed}_{ts}"
+        exp_dir.mkdir(parents=True, exist_ok=True)
         
-        meta = {
-            "type": "comparison",
-            "config_keys": config_keys,
-            "seed": seed,
-            "num_seeds": num_seeds,
-            "num_robots": num_robots,
-            "timestamp": ts,
-        }
-        with open(os.path.join(exp_dir, "meta.json"), "w") as f:
-            json.dump(meta, f, indent=4)
+        planners_info = {}
+        for k in config_keys:
+            c = EXPERIMENT_CONFIGS[k]
+            planners_info[k] = {
+                "name": c["name"],
+                "description": c["description"],
+                "planner": c["planner"]
+            }
 
-    events_file = os.path.join(exp_dir, "events.jsonl")
+        config_data = {
+            "schema_version": "2.0",
+            "timestamp": ts,
+            "experiment_name": f"Paired Comparison {keys_str}",
+            "experiment_type": "comparison",
+            "base_seed": seed,
+            "num_seeds": num_seeds,
+            "planner_configs": planners_info,
+            "robot_names": ["Blue", "Red", "Green", "Yellow"],
+            "grid": {
+                "rows": DEFAULT_SIM_CONFIG.GRID_ROWS,
+                "cols": DEFAULT_SIM_CONFIG.GRID_COLS,
+                "mine_density": DEFAULT_SIM_CONFIG.MINE_DENSITY,
+                "wall_density": DEFAULT_SIM_CONFIG.WALL_DENSITY
+            },
+            "sim": {
+                "max_ticks": DEFAULT_SIM_CONFIG.MAX_TICKS,
+                "conflict_policy": DEFAULT_SIM_CONFIG.CONFLICT_POLICY.name
+            }
+        }
+        with open(exp_dir / "config.json", "w") as f:
+            json.dump(config_data, f, indent=2)
+
+    events_file = exp_dir / "runs.jsonl"
     
-    # 2. Load completed events (for resume)
     completed_events = set()
-    if os.path.exists(events_file):
+    runs_data = []
+    if events_file.exists():
         with open(events_file, "r") as f:
             for line in f:
+                if not line.strip(): continue
                 evt = json.loads(line)
-                if evt.get("type") == "round_result":
-                    completed_events.add((evt["config"], evt["round_seed"]))
+                completed_events.add((evt["config"], evt["seed"]))
+                runs_data.append(evt)
     
     events_out = open(events_file, "a")
 
@@ -219,7 +337,11 @@ def run_paired_comparison(config_keys: List[str], seed: int, num_seeds: int,
             print(f"  Resuming : {len(completed_events)} rounds already complete.")
         print(f"{'='*60}\n")
 
-    # 3. Run missing rounds
+    if debug_runs:
+        (exp_dir / "debug").mkdir(exist_ok=True)
+
+    run_id_counter = len(runs_data)
+    
     try:
         for round_idx in range(num_seeds):
             round_seed = seed + round_idx
@@ -247,18 +369,49 @@ def run_paired_comparison(config_keys: List[str], seed: int, num_seeds: int,
                     
                 summary = game.round_summary[0]
                 
+                robots_list = []
+                any_death = False
+                for r_id, r_stat in sorted(summary.items()):
+                    steps = r_stat['steps']
+                    oracle = r_stat['shortest_oracle'] or 0
+                    eff = (oracle / steps) if steps > 0 else None
+                    if r_stat['hit_mine'] or r_stat['hit_robot']:
+                        any_death = True
+                    robots_list.append({
+                        "name": r_stat["name"],
+                        "reached": r_stat["reached"],
+                        "hit_mine": r_stat["hit_mine"],
+                        "hit_robot": r_stat["hit_robot"],
+                        "timed_out": r_stat["timed_out"],
+                        "steps": steps,
+                        "oracle_steps": oracle,
+                        "efficiency": eff,
+                        "excess_steps": max(0, steps - oracle),
+                        "replans": r_stat["replans"],
+                        "waits": r_stat["waits"],
+                        "unknown_cells_entered": r_stat["unknown_cells_entered"]
+                    })
+                
+                run_id_counter += 1
                 evt = {
-                    "type": "round_result",
+                    "run_id": run_id_counter,
                     "config": key,
-                    "round_idx": round_idx,
-                    "round_seed": round_seed,
-                    "summary": summary,
+                    "seed": round_seed,
                     "ticks": game.tick,
-                    "world_mines": game.world.count_mines(),
-                    "world_walls": game.world.count_walls()
+                    "world": {
+                        "mines": game.world.count_mines(),
+                        "walls": game.world.count_walls()
+                    },
+                    "robots": robots_list
                 }
+                runs_data.append(evt)
                 events_out.write(json.dumps(evt) + "\n")
                 events_out.flush()
+
+                if debug_runs and any_death:
+                    debug_file = exp_dir / "debug" / f"run_{run_id_counter}_{key}_seed{round_seed}.json"
+                    with open(debug_file, "w") as df:
+                        json.dump(summary, df, indent=2)
                 
                 if verbose:
                     reached = sum(1 for v in summary.values() if v["reached"])
@@ -270,163 +423,77 @@ def run_paired_comparison(config_keys: List[str], seed: int, num_seeds: int,
     finally:
         events_out.close()
     
-    # 4. Generate Final Summary
-    _generate_final_summary(exp_dir, config_keys, num_robots)
+    summary_doc = build_summary_dict(runs_data, config_keys, num_robots)
+    with open(exp_dir / "summary.json", "w") as f:
+        json.dump(summary_doc, f, indent=2)
+        
+    print_summary(str(exp_dir), config_keys, summary_doc)
+    generate_reports(str(exp_dir))
 
-
-def _generate_final_summary(exp_dir: str, config_keys: List[str], num_robots: int):
-    results_by_config = collections.defaultdict(list)
-    events_file = os.path.join(exp_dir, "events.jsonl")
-    if not os.path.exists(events_file):
-        return
-        
-    with open(events_file, "r") as f:
-        for line in f:
-            evt = json.loads(line)
-            if evt.get("type") == "round_result":
-                results_by_config[evt["config"]].append(evt)
-                
-    stats = {}
-    
-    for key in config_keys:
-        evts = results_by_config[key]
-        if not evts:
-            continue
-            
-        round_efficiencies = []
-        round_mine_deaths = []
-        round_coll_deaths = []
-        round_successes = []
-        
-        for evt in evts:
-            effs = []
-            mines = 0
-            colls = 0
-            succs = 0
-            for r_id, r_stat in evt["summary"].items():
-                if r_stat["reached"]:
-                    succs += 1
-                    effs.append((r_stat["shortest_oracle"] or 1) / max(1, r_stat["steps"]))
-                else:
-                    effs.append(0.0)
-                    if r_stat["hit_mine"]: mines += 1
-                    if r_stat["hit_robot"]: colls += 1
-            round_efficiencies.append(sum(effs) / num_robots)
-            round_mine_deaths.append(mines / num_robots)
-            round_coll_deaths.append(colls / num_robots)
-            round_successes.append(succs / num_robots)
-            
-        stats[key] = {
-            "efficiency": calculate_stats(round_efficiencies),
-            "mine_deaths": calculate_stats(round_mine_deaths),
-            "coll_deaths": calculate_stats(round_coll_deaths),
-            "success": calculate_stats(round_successes),
-            "raw": {
-                "efficiency": round_efficiencies,
-                "mine_deaths": round_mine_deaths,
-                "coll_deaths": round_coll_deaths,
-                "success": round_successes
-            }
-        }
-        
-    baseline_key = config_keys[0]
-    comparisons = {}
-    if HAS_SCIPY and baseline_key in stats:
-        for key in config_keys[1:]:
-            if key not in stats: continue
-            comparisons[key] = {
-                "efficiency": paired_t_test(stats[baseline_key]["raw"]["efficiency"], stats[key]["raw"]["efficiency"]),
-                "success": paired_t_test(stats[baseline_key]["raw"]["success"], stats[key]["raw"]["success"])
-            }
-            
-    summary_doc = {
-        "stats": {k: {mk: mv for mk, mv in v.items() if mk != "raw"} for k, v in stats.items()},
-        "comparisons": comparisons
-    }
-    with open(os.path.join(exp_dir, "summary.json"), "w") as f:
-        json.dump(summary_doc, f, indent=4)
-        
-    print(f"\n{'='*80}")
-    print(f"FINAL SUMMARY ({exp_dir})")
-    print(f"{'Config':<8} | {'Success Rate (95% CI)':<25} | {'Efficiency (95% CI)':<25} | {'Mine D.':<10}")
-    print("-" * 80)
-    for key in config_keys:
-        if key not in stats: continue
-        s = stats[key]
-        succ = s['success']
-        eff = s['efficiency']
-        mines = s['mine_deaths']
-        
-        succ_str = f"{succ['mean']:.1%} ± {succ['ci95']:.1%}"
-        eff_str = f"{eff['mean']:.3f} ± {eff['ci95']:.3f}"
-        
-        star = ""
-        if key in comparisons:
-            p_succ = comparisons[key]["success"][1]
-            if p_succ < 0.05: star = "*"
-            
-        print(f"{key:<8} | {succ_str+star:<25} | {eff_str:<25} | {mines['mean']:.1%}")
-    if HAS_SCIPY:
-        print(f"\n* denotes p < 0.05 vs Baseline ({baseline_key}) in paired t-test.")
-    else:
-        print(f"\n(scipy not installed; t-tests skipped)")
-    print("="*80)
-
-    # Convert generated JSON files to CSV for easier analysis
-    print("\nConverting and consolidating logs into master CSVs...")
-    convert_logs.convert_jsonl_to_csv(os.path.join(exp_dir, "events.jsonl"))
-    convert_logs.convert_json_to_csv(os.path.join(exp_dir, "meta.json"))
-    convert_logs.convert_json_to_csv(os.path.join(exp_dir, "summary.json"))
-    
-    import consolidate_logs
-    consolidate_logs.main()
-
-
-# ---------------------------------------------------------------------------
-# Personality sweep runner
-# ---------------------------------------------------------------------------
 
 def run_personality_sweep(sweep_key: str, seed: int, num_seeds: int,
                           num_robots: int = 4, output_dir: str = "logs",
                           resume_dir: Optional[str] = None, verbose: bool = True,
-                          use_gui: bool = False):
+                          use_gui: bool = False, debug_runs: bool = False):
+    """Run a parameter sweep for robot personalities."""
     sweep_cfg = PERSONALITY_SWEEPS[sweep_key]
     param = sweep_cfg["param"]
     values = sweep_cfg["values"]
     planner_type = sweep_cfg["planner"]
     planner_config = CONFIGS[planner_type]
+    out_path = Path(output_dir)
 
     if resume_dir:
-        exp_dir = resume_dir
-        if not os.path.exists(exp_dir):
+        exp_dir = Path(resume_dir)
+        if not exp_dir.exists():
             raise ValueError(f"Resume directory {exp_dir} does not exist.")
     else:
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        exp_dir = os.path.join(output_dir, f"sweep_{sweep_key}_seed{seed}_{ts}")
-        os.makedirs(exp_dir, exist_ok=True)
+        exp_dir = out_path / f"sweep_{sweep_key}_seed{seed}_{ts}"
+        exp_dir.mkdir(parents=True, exist_ok=True)
         
-        meta = {
-            "type": "sweep",
-            "sweep_key": sweep_key,
-            "param": param,
-            "values": values,
-            "seed": seed,
-            "num_seeds": num_seeds,
-            "num_robots": num_robots,
-            "timestamp": ts,
+        planners_info = {
+            str(v): {
+                "name": f"Sweep {param}={v}",
+                "description": f"Personality sweep for {param} set to {v}",
+                "planner": planner_type
+            } for v in values
         }
-        with open(os.path.join(exp_dir, "meta.json"), "w") as f:
-            json.dump(meta, f, indent=4)
+        
+        config_data = {
+            "schema_version": "2.0",
+            "timestamp": ts,
+            "experiment_name": f"Sweep: {sweep_cfg['label']}",
+            "experiment_type": "sweep",
+            "base_seed": seed,
+            "num_seeds": num_seeds,
+            "planner_configs": planners_info,
+            "robot_names": ["Blue", "Red", "Green", "Yellow"],
+            "grid": {
+                "rows": DEFAULT_SIM_CONFIG.GRID_ROWS,
+                "cols": DEFAULT_SIM_CONFIG.GRID_COLS,
+                "mine_density": DEFAULT_SIM_CONFIG.MINE_DENSITY,
+                "wall_density": DEFAULT_SIM_CONFIG.WALL_DENSITY
+            },
+            "sim": {
+                "max_ticks": DEFAULT_SIM_CONFIG.MAX_TICKS,
+                "conflict_policy": DEFAULT_SIM_CONFIG.CONFLICT_POLICY.name
+            }
+        }
+        with open(exp_dir / "config.json", "w") as f:
+            json.dump(config_data, f, indent=2)
 
-    events_file = os.path.join(exp_dir, "events.jsonl")
+    events_file = exp_dir / "runs.jsonl"
     
     completed_events = set()
-    if os.path.exists(events_file):
+    runs_data = []
+    if events_file.exists():
         with open(events_file, "r") as f:
             for line in f:
+                if not line.strip(): continue
                 evt = json.loads(line)
-                if evt.get("type") == "round_result":
-                    completed_events.add((str(evt["value"]), evt["round_seed"]))
+                completed_events.add((evt["config"], evt["seed"]))
+                runs_data.append(evt)
     
     events_out = open(events_file, "a")
 
@@ -436,6 +503,11 @@ def run_personality_sweep(sweep_key: str, seed: int, num_seeds: int,
         print(f"  Values  : {values}")
         print(f"  Output  : {exp_dir}")
         print(f"{'='*60}\n")
+
+    if debug_runs:
+        (exp_dir / "debug").mkdir(exist_ok=True)
+
+    run_id_counter = len(runs_data)
 
     try:
         for round_idx in range(num_seeds):
@@ -453,7 +525,6 @@ def run_personality_sweep(sweep_key: str, seed: int, num_seeds: int,
                     max_rounds=1
                 )
                 
-                # Override parameter
                 for r in game.robots:
                     setattr(r, param, val)
                 
@@ -467,17 +538,49 @@ def run_personality_sweep(sweep_key: str, seed: int, num_seeds: int,
                     
                 summary = game.round_summary[0]
                 
+                robots_list = []
+                any_death = False
+                for r_id, r_stat in sorted(summary.items()):
+                    steps = r_stat['steps']
+                    oracle = r_stat['shortest_oracle'] or 0
+                    eff = (oracle / steps) if steps > 0 else None
+                    if r_stat['hit_mine'] or r_stat['hit_robot']:
+                        any_death = True
+                    robots_list.append({
+                        "name": r_stat["name"],
+                        "reached": r_stat["reached"],
+                        "hit_mine": r_stat["hit_mine"],
+                        "hit_robot": r_stat["hit_robot"],
+                        "timed_out": r_stat["timed_out"],
+                        "steps": steps,
+                        "oracle_steps": oracle,
+                        "efficiency": eff,
+                        "excess_steps": max(0, steps - oracle),
+                        "replans": r_stat["replans"],
+                        "waits": r_stat["waits"],
+                        "unknown_cells_entered": r_stat["unknown_cells_entered"]
+                    })
+                
+                run_id_counter += 1
                 evt = {
-                    "type": "round_result",
-                    "sweep_key": sweep_key,
-                    "value": val_str,
-                    "round_idx": round_idx,
-                    "round_seed": round_seed,
-                    "summary": summary,
-                    "ticks": game.tick
+                    "run_id": run_id_counter,
+                    "config": val_str,
+                    "seed": round_seed,
+                    "ticks": game.tick,
+                    "world": {
+                        "mines": game.world.count_mines(),
+                        "walls": game.world.count_walls()
+                    },
+                    "robots": robots_list
                 }
+                runs_data.append(evt)
                 events_out.write(json.dumps(evt) + "\n")
                 events_out.flush()
+
+                if debug_runs and any_death:
+                    debug_file = exp_dir / "debug" / f"run_{run_id_counter}_{val_str}_seed{round_seed}.json"
+                    with open(debug_file, "w") as df:
+                        json.dump(summary, df, indent=2)
                 
                 if verbose:
                     reached = sum(1 for v in summary.values() if v["reached"])
@@ -485,8 +588,13 @@ def run_personality_sweep(sweep_key: str, seed: int, num_seeds: int,
     finally:
         events_out.close()
         
-    _generate_final_summary(exp_dir, [str(v) for v in values], num_robots)
-
+    config_keys = [str(v) for v in values]
+    summary_doc = build_summary_dict(runs_data, config_keys, num_robots)
+    with open(exp_dir / "summary.json", "w") as f:
+        json.dump(summary_doc, f, indent=2)
+        
+    print_summary(str(exp_dir), config_keys, summary_doc)
+    generate_reports(str(exp_dir))
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -503,6 +611,7 @@ def main():
     parser.add_argument("--personality-sweep", choices=list(PERSONALITY_SWEEPS.keys()))
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--gui", action="store_true", help="Render the experiment using Pygame GUI")
+    parser.add_argument("--debug-runs", action="store_true", help="Save round summaries for runs with deaths")
 
     args = parser.parse_args()
 
@@ -516,6 +625,7 @@ def main():
             resume_dir=args.resume,
             verbose=not args.quiet,
             use_gui=args.gui,
+            debug_runs=args.debug_runs,
         )
     else:
         run_paired_comparison(
@@ -527,8 +637,8 @@ def main():
             resume_dir=args.resume,
             verbose=not args.quiet,
             use_gui=args.gui,
+            debug_runs=args.debug_runs,
         )
-
 
 if __name__ == "__main__":
     main()
