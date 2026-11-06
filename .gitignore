@@ -3,3 +3,12 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.zip
+
+# Safety ignores for migration
+.env
+.env.*
+!.env.example
+*.env
+.venv/
+env/
+node_modules/
